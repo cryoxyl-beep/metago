@@ -4,6 +4,7 @@ import { extractTextFromPdf, parseQuestionsFromText, assessChunkConfidence } fro
 import { Question, QuestionSet } from "../types";
 import { collection, doc, writeBatch, Timestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase/config";
+import { GoogleGenAI, Type } from "@google/genai";
 import { 
   FileText, 
   Upload, 
@@ -118,20 +119,102 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     setExtractionStage(`Applying AI recovery to ${malformedChunks.length} malformed question blocks...`);
 
     try {
-      const response = await fetch("/api/gemini/clean-questions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ chunks: malformedChunks })
-      });
-
-      if (!response.ok) {
-        throw new Error(`Server API response was not OK: ${response.statusText}`);
+      const apiKey = (import.meta as any).env.VITE_GEMINI_API_KEY;
+      if (!apiKey || apiKey.trim() === "" || apiKey === "YOUR_GEMINI_API_KEY") {
+        console.warn("[Gemini Client] VITE_GEMINI_API_KEY is not configured or left as placeholder in environment variables.");
+        throw new Error("Missing VITE_GEMINI_API_KEY. Please provide the key in the settings panel or .env file.");
       }
 
-      const data = await response.json();
-      const aiQuestions: Question[] = (data.questions || []).map((q: any, index: number) => {
+      // Log: Gemini request started
+      // Log: malformed chunk count
+      console.log(`[Gemini Request] Started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
+
+      const ai = new GoogleGenAI({
+        apiKey: apiKey,
+        httpOptions: {
+          headers: {
+            "User-Agent": "aistudio-build"
+          }
+        }
+      });
+
+      // Batch 3 to 5 malformed chunks maximum per request
+      const batchSize = 4;
+      const batches: string[][] = [];
+      for (let i = 0; i < malformedChunks.length; i += batchSize) {
+        batches.push(malformedChunks.slice(i, i + batchSize));
+      }
+
+      console.log(`[Gemini Client] Batching ${malformedChunks.length} malformed chunks into ${batches.length} requests (size: ${batchSize}).`);
+
+      const batchPromises = batches.map(async (batch, batchIdx) => {
+        const userPrompt = `Reconstruct the following mangled multiple choice question blocks from a PDF reading extraction.
+Separate any merged questions if they got lumped together. Isolate options correctly (A, B, C, D) and preserve the wording, equations, and symbols.
+Do not invent any details or answers or explanations that are not present in the source text.
+If no answer key is clearly mentioned, keep "correct_option_index" as null.
+If there is no explanation, keep "explanation" as an empty string.
+
+--- START QUESTION BLOCKS TO RECONSTRUCT ---
+${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
+--- END QUESTION BLOCKS ---`;
+
+        console.log(`[Gemini Client] Requesting batch ${batchIdx + 1} of ${batches.length}...`);
+
+        const response = await ai.models.generateContent({
+          model: "gemini-1.5-flash",
+          contents: userPrompt,
+          config: {
+            systemInstruction: "You are an expert curriculum assistant specializing in PDF reading recovery. Your sole job is to clean, separate, and reconstruct malformed question blocks into JSON format. Do not make up answers, do not speculate explanations, and do not invent content. Always preserve exact math equations, symbols, and formatting where possible.",
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  question_text: { 
+                    type: Type.STRING,
+                    description: "The complete visual text of the question, preserving symbols." 
+                  },
+                  options: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: "The 4 options for multiple choices (A, B, C, D). If fewer are present, pad with empty strings."
+                  },
+                  correct_option_index: { 
+                    type: Type.INTEGER, 
+                    description: "Index (0 to 3) matching A to D. Null if not specified or unclear in the source chunk."
+                  },
+                  explanation: { 
+                    type: Type.STRING,
+                    description: "Explanation details if found. Empty string if none is present."
+                  }
+                },
+                required: ["question_text", "options", "correct_option_index", "explanation"]
+              }
+            }
+          }
+        });
+
+        // Log: Gemini response received
+        const responseText = response.text || "[]";
+        console.log(`[Gemini Client] Response received for batch ${batchIdx + 1}. Raw length: ${responseText.length}`);
+
+        try {
+          const parsedGroup = JSON.parse(responseText.trim());
+          // Log: JSON parse success
+          console.log(`[Gemini Client] JSON parse success for batch ${batchIdx + 1}. Reconstructed ${parsedGroup.length} items.`);
+          return parsedGroup;
+        } catch (jsonErr) {
+          // Log: JSON parse failure
+          console.error(`[Gemini Client] JSON parse failure for batch ${batchIdx + 1}:`, responseText, jsonErr);
+          throw jsonErr;
+        }
+      });
+
+      const results = await Promise.all(batchPromises);
+      const combinedResults = results.flat();
+
+      const aiQuestions: Question[] = combinedResults.map((q: any, index: number) => {
         const options = Array.isArray(q.options) ? q.options : ["", "", "", ""];
         while (options.length < 4) {
           options.push("");
@@ -177,10 +260,10 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
         setWarning(`AI cleanup recovery applied to malformed question blocks. Reconstructed ${aiQuestions.length} questions semantically from mangled PDF layout.`);
       }
     } catch (apiErr: any) {
-      console.warn("[Client Fallback] Gemini clean-questions endpoint failed:", apiErr);
+      console.warn("[Gemini Client Fallback] direct model request failed:", apiErr);
       setQuestions(initialQuestions);
       setAiCleanedCount(0);
-      setWarning(`Notice: AI-powered recovery was bypassed due to service issue: ${apiErr.message || "Endpoint offline"}. Reverting to default regex parsed result.`);
+      setWarning(`Notice: AI-powered recovery was bypassed (${apiErr.message || "Invalid API key or network block"}). Reverting to default regex parsed result.`);
     } finally {
       setIsAiCleaning(false);
     }
