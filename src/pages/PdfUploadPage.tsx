@@ -124,12 +124,14 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
         throw new Error("Missing VITE_GROQ_API_KEY. Please provide the key in the settings panel or .env file.");
       }
 
+      const activeModel = "qwen/qwen3-32b";
+      const fallbackModel = "llama-3.3-70b-versatile";
+
       // 1. Log: Groq request started (malformed chunk count)
       console.log(`[Groq Client] Request started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
 
       // 2. Log: Active model string used
-      const activeModel = "qwen-2.5-coder-32b";
-      console.log(`[Groq Client] Active model string used: ${activeModel}`);
+      console.log(`[Groq Client] Active model string selected: ${activeModel}. Fallback model: ${fallbackModel}`);
 
       // Batch 3 to 5 malformed chunks maximum per request
       const batchSize = 4;
@@ -151,7 +153,7 @@ Keep "explanation" as an empty string.
 ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
 --- END QUESTION BLOCKS ---`;
 
-        console.log(`[Groq Client] Fetching batch ${batchIdx + 1} of ${batches.length} from Groq...`);
+        console.log(`[Groq Client] Preparing fetch for batch ${batchIdx + 1} of ${batches.length}.`);
 
         const systemMessage = `You are an expert curriculum assistant specializing in PDF reading recovery. Your sole job is to clean, separate, and reconstruct malformed question blocks into JSON format. Do not make up answers, do not speculate explanations, and do not invent content. Always preserve exact math equations, symbols, and formatting where possible.
 You MUST reply with a JSON object containing a "questions" key containing an array of reconstructed question items in this exact schema format:
@@ -166,40 +168,67 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
   ]
 }`;
 
-        const startTime = performance.now();
+        const makeRequest = async (modelName: string) => {
+          return await fetch("https://api.groq.com/openai/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${apiKey}`
+            },
+            body: JSON.stringify({
+              model: modelName,
+              messages: [
+                { role: "system", content: systemMessage },
+                { role: "user", content: userPrompt }
+              ],
+              temperature: 0.1,
+              response_format: { type: "json_object" }
+            })
+          });
+        };
 
-        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKey}`
-          },
-          body: JSON.stringify({
-            model: activeModel,
-            messages: [
-              { role: "system", content: systemMessage },
-              { role: "user", content: userPrompt }
-            ],
-            temperature: 0.1,
-            response_format: { type: "json_object" }
-          })
-        });
+        const startTime = performance.now();
+        let response: Response;
+        let finalModelUsed = activeModel;
+
+        try {
+          console.log(`[Groq Client] Dispatching request with active model: ${activeModel} (Batch ${batchIdx + 1}/${batches.length})`);
+          response = await makeRequest(activeModel);
+          if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`Groq API response not OK: ${response.status} ${errText}`);
+          }
+        } catch (error: any) {
+          // Log: model failure reason
+          console.warn(`[Groq Client] Active model (${activeModel}) failed for batch ${batchIdx + 1}.`);
+          console.warn(`[Groq Client] Model failure reason: ${error?.message || error}`);
+          
+          // Log: fallback model usage
+          console.log(`[Groq Client] Fallback model usage triggered. Switching to fallback model: ${fallbackModel} (Batch ${batchIdx + 1}/${batches.length})`);
+          
+          finalModelUsed = fallbackModel;
+          try {
+            response = await makeRequest(fallbackModel);
+            if (!response.ok) {
+              const errText = await response.text();
+              throw new Error(`Fallback Groq API response not OK: ${response.status} ${errText}`);
+            }
+          } catch (fallbackError: any) {
+            console.error(`[Groq Client] Fallback model (${fallbackModel}) also failed for batch ${batchIdx + 1}: ${fallbackError?.message || fallbackError}`);
+            throw fallbackError;
+          }
+        }
 
         const nativeLatency = performance.now() - startTime;
-        // 3. Log: Native response latency (ms)
-        console.log(`[Groq Client] Native response latency for batch ${batchIdx + 1}: ${nativeLatency.toFixed(2)} ms. HTTP Status: ${response.status}`);
-
-        if (!response.ok) {
-          const errText = await response.text();
-          throw new Error(`Groq API returned failure status ${response.status}: ${errText}`);
-        }
+        // Log: Native response latency (ms) and final model used
+        console.log(`[Groq Client] Native response latency for batch ${batchIdx + 1}: ${nativeLatency.toFixed(2)} ms. Model used: ${finalModelUsed}. HTTP Status: ${response.status}`);
 
         const responseData = await response.json();
         const responseText = responseData?.choices?.[0]?.message?.content || "{}";
 
         try {
           const parsedGroup = JSON.parse(responseText.trim());
-          // 4. Log: JSON parsing success
+          // Log: JSON parsing success
           console.log(`[Groq Client] JSON parsing success status for batch ${batchIdx + 1}.`);
 
           let list: any[] = [];
@@ -215,7 +244,7 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
           }
           return list;
         } catch (jsonErr) {
-          // 4. Log: JSON parsing failure
+          // Log: JSON parsing failure
           console.error(`[Groq Client] JSON parsing failure status for batch ${batchIdx + 1}:`, responseText, jsonErr);
           throw jsonErr;
         }
@@ -520,7 +549,7 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
               <div className="bg-emerald-555 h-full w-1/3 rounded-full animate-pulse" />
             </div>
             <p className="text-[10px] text-zinc-500 font-mono">
-              Running Qwen 2.5 Coder 32B semantic recovery on Groq
+              Running Qwen 3 32B / Llama 3.3 70B semantic recovery on Groq
             </p>
           </div>
         </div>
