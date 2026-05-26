@@ -20,34 +20,34 @@ export const AuthPage: React.FC = () => {
   };
 
   return (
-    <div className="min-h-screen bg-black text-zinc-100 flex flex-col justify-center items-center px-4">
-      <div className="w-full max-w-md p-8 border border-zinc-900 bg-zinc-950 rounded-lg shadow-2xl flex flex-col items-center">
+    <div className="min-h-screen bg-[#fafaf8] text-zinc-800 flex flex-col justify-center items-center px-4 font-sans selection:bg-zinc-200">
+      <div className="w-full max-w-md p-8 border border-zinc-200 bg-white rounded-2xl shadow-[0_8px_30px_rgb(0,0,0,0.02)] flex flex-col items-center">
         {/* Flat minimal logo branding */}
-        <div className="p-3 bg-zinc-900 border border-zinc-800 rounded-lg mb-6">
-          <BookOpen className="w-8 h-8 text-white" />
+        <div className="p-3 bg-zinc-50 border border-zinc-200 rounded-xl mb-6">
+          <BookOpen className="w-8 h-8 text-zinc-700" />
         </div>
 
-        <h1 className="text-2xl font-semibold tracking-tight text-white mb-2 font-sans">
-          Mock Test Generator
+        <h1 className="text-2xl font-semibold tracking-tight text-zinc-900 mb-2 font-sans">
+          InstaMocks
         </h1>
-        <p className="text-zinc-400 text-sm mb-8 text-center max-w-sm">
-          Convert uploaded PYQ PDFs into highly structured interactive practice sessions helper. Offline-first parsing and instant local grading.
+        <p className="text-zinc-500 text-sm mb-8 text-center max-w-sm leading-relaxed">
+          Your personal academic companion. Convert class notes, papers, and PDFs into customized, distraction-free mock tests instantly.
         </p>
 
         {!dbOnline && (
-          <div className="w-full h-auto p-3 mb-6 bg-amber-950/20 border border-amber-900 text-amber-500 text-xs rounded-lg flex items-start gap-2.5">
+          <div className="w-full h-auto p-3 mb-6 bg-amber-50/50 border border-amber-200 text-amber-700 text-xs rounded-lg flex items-start gap-2.5">
             <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
             <div>
-              <p className="font-semibold">Firebase Project Offline</p>
-              <p className="text-amber-500/80 mt-0.5">
-                Using local state for development mode. Data will persist in memory.
+              <p className="font-semibold">Firebase Project Saved Locally</p>
+              <p className="text-amber-600/90 mt-0.5">
+                Now operating securely using local sandboxed storage. Your worksheets remain local to your computer.
               </p>
             </div>
           </div>
         )}
 
         {error && (
-          <div className="w-full bg-red-950/30 border border-red-900 text-red-400 p-3 rounded-lg text-xs mb-6 text-center">
+          <div className="w-full bg-rose-50 border border-rose-200 text-rose-700 p-3 rounded-lg text-xs mb-6 text-center">
             {error}
           </div>
         )}
@@ -55,10 +55,10 @@ export const AuthPage: React.FC = () => {
         <button
           onClick={handleSignIn}
           disabled={loading}
-          className="w-full flex items-center justify-center gap-3 bg-white text-black font-medium text-sm py-3 px-5 rounded-md hover:bg-zinc-200 focus:outline-none transition-colors border border-zinc-200 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-full flex items-center justify-center gap-3 bg-zinc-900 text-white font-medium text-sm py-3 px-5 rounded-xl hover:bg-zinc-800 focus:outline-none transition-all shadow-sm active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {loading ? (
-            <div className="w-5 h-5 border-2 border-black border-t-transparent rounded-full animate-spin" />
+            <div className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
           ) : (
             <>
               <LogIn className="w-4 h-4" />
@@ -67,8 +67,8 @@ export const AuthPage: React.FC = () => {
           )}
         </button>
 
-        <span className="text-xs text-zinc-600 mt-8 text-center">
-          Secured with Firebase Auth. No document storage on servers.
+        <span className="text-xs text-zinc-400 mt-8 text-center block">
+          Secured with Firebase Auth & Cloud Storage.
         </span>
       </div>
     </div>

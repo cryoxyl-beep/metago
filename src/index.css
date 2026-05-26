@@ -6,28 +6,28 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
-/* Custom minimal scrollbar variables for black slate theme */
+/* Custom minimal warm scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 
 ::-webkit-scrollbar-track {
-  background: #000000;
+  background: #fafaf8;
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #1f1f23;
+  background: #e4e4df;
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: #2d2d34;
+  background: #d4d4cd;
 }
 
-/* Base style normalizations */
+/* Body styled with warm off-white background and clean charcoal text */
 body {
-  background-color: #000000;
-  color: #f4f4f5;
+  background-color: #fafaf8;
+  color: #1a1a19;
   font-family: var(--font-sans);
 }

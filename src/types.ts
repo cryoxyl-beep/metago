@@ -91,4 +91,4 @@ export interface OcrTelemetry {
   }[];
 }
 
-export type AppView = "dashboard" | "upload" | "setup-mock" | "mock-test" | "results" | "auth";
+export type AppView = "dashboard" | "mock-tests" | "pyq-library" | "practice" | "analytics" | "upload" | "setup-mock" | "mock-test" | "results" | "auth";
