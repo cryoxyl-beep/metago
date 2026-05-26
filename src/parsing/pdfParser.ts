@@ -1,10 +1,12 @@
 import * as pdfjsLib from "pdfjs-dist";
 import { Question } from "../types";
 
-// Setup worker source dynamically with standard .js from cdnjs
+// Setup stable Vite-compatible worker source using local dependency resolution
 if (typeof window !== "undefined") {
-  pdfjsLib.GlobalWorkerOptions.workerSrc =
-    `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+    "pdfjs-dist/build/pdf.worker.min.mjs",
+    import.meta.url
+  ).toString();
 }
 
 /**
