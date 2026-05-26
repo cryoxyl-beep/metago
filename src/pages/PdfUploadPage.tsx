@@ -157,7 +157,23 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
 
   // Inline worksheet cell updates
   const handleQuestionTextChange = (id: string, text: string) => {
-    setQuestions(questions.map(q => q.id === id ? { ...q, questionText: text } : q));
+    setQuestions(questions.map(q => {
+      if (q.id === id) {
+        const isBlank = text.trim() === "";
+        const insufficientOpts = q.options.filter(o => o.trim()).length < 2;
+        const hasWarning = isBlank || insufficientOpts || q.correctOptionIndex === -1;
+        let warningReason = "";
+        if (isBlank) {
+          warningReason = "Question description is completely blank.";
+        } else if (insufficientOpts) {
+          warningReason = "Missing multiple-choice options (Requires at least 2).";
+        } else if (q.correctOptionIndex === -1) {
+          warningReason = "No correct answer index selected. Specify answer key manually on the card.";
+        }
+        return { ...q, questionText: text, hasWarning, warningReason };
+      }
+      return q;
+    }));
   };
 
   const handleOptionTextChange = (id: string, optIdx: number, text: string) => {
@@ -165,14 +181,41 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       if (q.id === id) {
         const nextOptions = [...q.options];
         nextOptions[optIdx] = text;
-        return { ...q, options: nextOptions };
+        const isBlank = q.questionText.trim() === "";
+        const insufficientOpts = nextOptions.filter(o => o.trim()).length < 2;
+        const hasWarning = isBlank || insufficientOpts || q.correctOptionIndex === -1;
+        let warningReason = "";
+        if (isBlank) {
+          warningReason = "Question description is completely blank.";
+        } else if (insufficientOpts) {
+          warningReason = "Missing multiple-choice options (Requires at least 2).";
+        } else if (q.correctOptionIndex === -1) {
+          warningReason = "No correct answer index selected. Specify answer key manually on the card.";
+        }
+        return { ...q, options: nextOptions, hasWarning, warningReason };
       }
       return q;
     }));
   };
 
   const handleCorrectOptionChange = (id: string, opIdx: number) => {
-    setQuestions(questions.map(q => q.id === id ? { ...q, correctOptionIndex: opIdx } : q));
+    setQuestions(questions.map(q => {
+      if (q.id === id) {
+        const isBlank = q.questionText.trim() === "";
+        const insufficientOpts = q.options.filter(o => o.trim()).length < 2;
+        const hasWarning = isBlank || insufficientOpts || opIdx === -1;
+        let warningReason = "";
+        if (isBlank) {
+          warningReason = "Question description is completely blank.";
+        } else if (insufficientOpts) {
+          warningReason = "Missing multiple-choice options (Requires at least 2).";
+        } else if (opIdx === -1) {
+          warningReason = "No correct answer index selected. Specify answer key manually on the card.";
+        }
+        return { ...q, correctOptionIndex: opIdx, hasWarning, warningReason };
+      }
+      return q;
+    }));
   };
 
   const handleExplanationChange = (id: string, explanation: string) => {
@@ -471,8 +514,19 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
               {questions.map((q, qIdx) => (
                 <div 
                   key={q.id}
-                  className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg flex flex-col gap-4 relative"
+                  className={`border p-5 rounded-lg flex flex-col gap-4 relative transition-all
+                  ${q.hasWarning 
+                    ? "border-amber-600/35 bg-amber-950/5 shadow-sm shadow-amber-950/10" 
+                    : "border-zinc-900 bg-zinc-950"
+                  }`}
                 >
+                  {q.hasWarning && (
+                    <div className="flex items-center gap-2 bg-amber-950/20 border border-amber-900/60 p-2.5 rounded text-[11px] text-amber-300 animate-fade-in font-mono">
+                      <AlertCircle className="w-4 h-4 shrink-0 text-amber-400" />
+                      <span>{q.warningReason || "Notice: Question requires correction."}</span>
+                    </div>
+                  )}
+
                   {/* Delete button */}
                   <button 
                     onClick={() => handleRemoveQuestion(q.id)}

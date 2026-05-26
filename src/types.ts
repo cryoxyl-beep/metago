@@ -7,6 +7,8 @@ export interface Question {
   subject?: string;
   exam?: string;
   year?: string;
+  hasWarning?: boolean;
+  warningReason?: string;
 }
 
 export interface QuestionSet {

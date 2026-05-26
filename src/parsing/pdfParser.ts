@@ -194,7 +194,6 @@ export function tryExtractInlineOptions(text: string): { questionText: string, o
       });
     }
 
-    // Sort/filter unique matches to keep the first occurrence of each letter option
     const indices: Record<string, number> = {};
     matches.forEach(m => {
       if (indices[m.char] === undefined) {
@@ -205,7 +204,6 @@ export function tryExtractInlineOptions(text: string): { questionText: string, o
     if (indices["A"] !== undefined && indices["B"] !== undefined) {
       const foundKeys = ["A", "B", "C", "D"].filter(k => indices[k] !== undefined);
       if (foundKeys.length >= 2) {
-        // Question text is everything before the first option key
         const qText = text.substring(0, indices[foundKeys[0]]).trim();
         const options: string[] = ["", "", "", ""];
 
@@ -229,214 +227,265 @@ export function tryExtractInlineOptions(text: string): { questionText: string, o
 }
 
 /**
+ * Splits the entire text into isolated, self-contained question chunks.
+ * Uses aggressive boundary regex patterns representing Q1, Q1., 1., 1), Question 1, etc.
+ * Terminates previous questions immediately when a new number appears, avoiding text-bleeding.
+ */
+export function splitIntoQuestionChunks(text: string): { number: number; text: string }[] {
+  // Regex designed to match Q1, Q1., Q1:, 1., 1), Question 1, Q 15 :, 15.
+  // Must make sure pure digits with punctuation match only after newline/start of text (to prevent inline number conflict).
+  // Digit length constrained to 1-3 to prevent conflicts with year marks (e.g. 2024).
+  const boundaryRegex = /(?:^|\r?\n)\s*(?:(?:[Qq]uestion|[Qq])\s*(\d{1,3})(?:\s*[\.\)\-\:\s]+)?|(\d{1,3})\s*[\.\)\-\:]+)/gi;
+  boundaryRegex.lastIndex = 0;
+
+  const matches: { number: number; index: number; length: number }[] = [];
+  let match;
+  while ((match = boundaryRegex.exec(text)) !== null) {
+    const numStr = match[1] || match[2];
+    const num = parseInt(numStr, 10);
+    matches.push({
+      number: num,
+      index: match.index,
+      length: match[0].length
+    });
+  }
+
+  // Sort matched positions ascendingly by character offset
+  matches.sort((a, b) => a.index - b.index);
+
+  // Filter consecutive matches targeting identical indices to prevent duplicate splits
+  const uniqueMatches: typeof matches = [];
+  matches.forEach(m => {
+    if (uniqueMatches.length === 0 || uniqueMatches[uniqueMatches.length - 1].index !== m.index) {
+      uniqueMatches.push(m);
+    }
+  });
+
+  const chunks: { number: number; text: string }[] = [];
+
+  if (uniqueMatches.length === 0) {
+    // Stage 1 Fallback Split: lax numeric prefix split for start of lines
+    const laxRegex = /(?:^|\r?\n)\s*(\d{1,3})\s+/gi;
+    let laxMatch;
+    while ((laxMatch = laxRegex.exec(text)) !== null) {
+      uniqueMatches.push({
+        number: parseInt(laxMatch[1], 10),
+        index: laxMatch.index,
+        length: laxMatch[0].length
+      });
+    }
+    uniqueMatches.sort((a, b) => a.index - b.index);
+  }
+
+  if (uniqueMatches.length > 0) {
+    for (let i = 0; i < uniqueMatches.length; i++) {
+      const current = uniqueMatches[i];
+      const startIdx = current.index;
+      const endIdx = (i + 1 < uniqueMatches.length) ? uniqueMatches[i + 1].index : text.length;
+      
+      const chunkText = text.substring(startIdx, endIdx);
+      chunks.push({
+        number: current.number,
+        text: chunkText
+      });
+    }
+  } else {
+    // Stage 2 Fallback Split: Paragraph block chunking
+    const paragraphs = text.split(/\r?\n\r?\n/).map(p => p.trim()).filter(p => p.length > 8);
+    paragraphs.forEach((para, idx) => {
+      chunks.push({
+        number: idx + 1,
+        text: para
+      });
+    });
+  }
+
+  return chunks;
+}
+
+/**
  * Parses raw extracted text deterministically into structured Question models.
- * Highly tolerant to spacing issues, different formats, inconsistent numbering, and custom structures.
+ * Completely isolates text into separate sub-chunks to prevent cross-question bleeding.
  */
 export function parseQuestionsFromText(text: string): Question[] {
-  // Pre-clean text: handle typical double-spacing and broken spaces around some punctuation
-  const lines = text
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(line => line.length > 0);
+  console.log(`[PDF Parser] Init parsing. Text length: ${text.length} chars.`);
+  
+  // STEP 1: Global Question Splitting
+  const chunks = splitIntoQuestionChunks(text);
+  console.log(`[PDF Parser] Chunking Complete: Isolated ${chunks.length} distinct question segments.`);
 
   const questions: Question[] = [];
-  let currentQuestion: Partial<Question> | null = null;
-  let currentOptionIndex: number = -1;
+  const failedIndexes: number[] = [];
 
-  // Tolerant regular expressions for question headings
-  // Matches "Question 1.", "Q1:", "1.", "1)", "Question(1)", "Q.1", "15 "
-  const questionRegex = /^(?:Q|q)?(?:uestion)?\s*\(?(\d{1,3})\)?[\.\-\)\s:]+\s*(.*)$/i;
+  // Scorer patterns to locate multiple choice option boundaries
+  const optionPatterns = [
+    { regex: /(?:\s+|^)\(([A-Da-d])\)\s+/gi, type: "parentheses" },
+    { regex: /(?:\s+|^)([A-Da-d])\)\s+/gi, type: "right-parenthesis" },
+    { regex: /(?:\s+|^)\[([A-Da-d])\]\s+/gi, type: "brackets" },
+    { regex: /(?:\s+|^)([A-Da-d])\.\s+/gi, type: "dot" },
+    { regex: /(?:\s+|^)([A-Da-d])\s*[\-\:]\s+/gi, type: "dash-or-colon" }
+  ];
 
-  // Matches "(A) xyz", "A. xyz", "A) xyz", "A - xyz"
-  const optionRegex = /^\s*[\(\[=]?([A-Da-d])[\)\]\.\-\s=]+\s*(.*)$/;
+  for (let idx = 0; idx < chunks.length; idx++) {
+    const chunkObj = chunks[idx];
+    const chunkNumber = chunkObj.number;
+    
+    // STEP 2: Clean Question Chunk - Normalizes spacing but preserves newlines which guide separators
+    let chunkText = chunkObj.text.trim();
+    chunkText = chunkText.replace(/[ \t]+/g, " ");
 
-  // Matches "Answer: A" or "Ans. B" or "Correct Option: C"
-  const answerRegex = /^(?:Ans(?:wer)?|Correct(?:\s*Option)?)\s*[:\.\-]?\s*[\(\[]?([A-Da-d])[\)\]\.]?\s*$/i;
+    // Remove the starting question tag (e.g. "Question 1.", "1.", "Q15:") from question content
+    let qContentRaw = chunkText;
+    const startingHeaderRegex = /^(?:(?:[Qq]uestion|[Qq])\s*(\d{1,3})(?:\s*[\.\)\-\:\s]+)?|(\d{1,3})\s*[\.\)\-\:]+)/i;
+    const stripMatch = qContentRaw.match(startingHeaderRegex);
+    if (stripMatch) {
+      qContentRaw = qContentRaw.substring(stripMatch[0].length).trim();
+    }
 
-  const flushCurrent = () => {
-    if (currentQuestion && currentQuestion.questionText) {
-      // Inline options extraction fallback (if we didn't extract options split on different lines)
-      const existingOptionsCount = (currentQuestion.options || []).filter(o => o && o.trim().length > 0).length;
-      if (existingOptionsCount < 2) {
-        const inlineRes = tryExtractInlineOptions(currentQuestion.questionText);
-        if (inlineRes) {
-          currentQuestion.questionText = inlineRes.questionText;
-          currentQuestion.options = inlineRes.options;
+    // STEP 3: Multi-Pattern Option Marker Extraction
+    interface OptionMarker {
+      key: string;
+      index: number;
+      contentIndex: number;
+    }
+
+    let bestMatches: OptionMarker[] = [];
+    let maxScore = 0;
+
+    for (const pat of optionPatterns) {
+      pat.regex.lastIndex = 0;
+      const currentMatches: OptionMarker[] = [];
+      let m;
+      while ((m = pat.regex.exec(qContentRaw)) !== null) {
+        currentMatches.push({
+          key: m[1].toUpperCase(),
+          index: m.index,
+          contentIndex: m.index + m[0].length
+        });
+      }
+
+      // Check unique matching options A -> B -> C -> D in strict ascending indexing order to ensure layout symmetry
+      const orderedMatches: OptionMarker[] = [];
+      let lastMatchIndex = -1;
+      const targetOptionLetters = ["A", "B", "C", "D"];
+
+      for (const letter of targetOptionLetters) {
+        const found = currentMatches.find(matchObj => matchObj.key === letter && matchObj.index > lastMatchIndex);
+        if (found) {
+          orderedMatches.push(found);
+          lastMatchIndex = found.index;
         }
       }
 
-      // Check options inside options[0] as a fallback
-      if (currentQuestion.options && currentQuestion.options[0] && currentQuestion.options[1] === "") {
-        const inlineRes = tryExtractInlineOptions(currentQuestion.options[0]);
-        if (inlineRes) {
-          currentQuestion.options[0] = inlineRes.questionText;
-          for (let oi = 1; oi < 4; oi++) {
-            if (inlineRes.options[oi]) {
-              currentQuestion.options[oi] = inlineRes.options[oi];
-            }
-          }
+      const score = orderedMatches.length;
+      if (score > maxScore) {
+        maxScore = score;
+        bestMatches = orderedMatches;
+      }
+    }
+
+    let finalQText = qContentRaw;
+    let finalOptions: string[] = ["", "", "", ""];
+    let extractedOptionCount = 0;
+
+    // STEP 4: Question Body / Option Isolation
+    if (bestMatches.length >= 2) {
+      // Everything preceding the first option marker serves as the body
+      finalQText = qContentRaw.substring(0, bestMatches[0].index).trim();
+
+      for (let i = 0; i < bestMatches.length; i++) {
+        const curr = bestMatches[i];
+        const next = bestMatches[i + 1];
+        const start = curr.contentIndex;
+        const end = next ? next.index : qContentRaw.length;
+
+        let optionContent = qContentRaw.substring(start, end).trim();
+
+        // Strip any trailing answer keys or explanations leaking inside option contents
+        const ansTriggerPos = optionContent.search(/(?:Ans(?:wer)?|Correct(?:\s*Option)?)\s*[:\.\-]?/i);
+        if (ansTriggerPos !== -1) {
+          optionContent = optionContent.substring(0, ansTriggerPos);
+        }
+        const expTriggerPos = optionContent.search(/(?:Explanation|Exp|Rationale)\s*[:\.\-]/i);
+        if (expTriggerPos !== -1) {
+          optionContent = optionContent.substring(0, expTriggerPos);
+        }
+
+        const optionIdx = curr.key.charCodeAt(0) - 65; // A=0, B=1, C=2, D=3
+        if (optionIdx >= 0 && optionIdx < 4) {
+          finalOptions[optionIdx] = optionContent.trim();
+          extractedOptionCount++;
         }
       }
-
-      // Ensure we always have exactly 4 options (A, B, C, D)
-      const finalOptions = currentQuestion.options || [];
-      while (finalOptions.length < 4) {
-        finalOptions.push("");
-      }
-
-      const qText = currentQuestion.questionText.trim();
-      const sanitizedOptions = finalOptions.map((opt, oIdx) => {
-        let cleanOpt = opt ? opt.trim() : "";
-        // Clean out trailing options delimiter leaks if any
-        return cleanOpt;
-      });
-
-      questions.push({
-        id: currentQuestion.id || `q-${Math.random().toString(36).substr(2, 9)}`,
-        questionText: qText,
-        options: sanitizedOptions,
-        correctOptionIndex: currentQuestion.correctOptionIndex !== undefined ? currentQuestion.correctOptionIndex : -1,
-        explanation: currentQuestion.explanation ? currentQuestion.explanation.trim() : "",
-      } as Question);
-    }
-    currentQuestion = null;
-    currentOptionIndex = -1;
-  };
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-
-    // Check for Question signature
-    const qMatch = line.match(questionRegex);
-    if (qMatch) {
-      flushCurrent();
-      const num = qMatch[1];
-      const rest = qMatch[2] || "";
-
-      // See if inline options exist immediately in the rest of the question title
-      const inlineRes = tryExtractInlineOptions(rest);
-      if (inlineRes) {
-        currentQuestion = {
-          id: `q-${num}-${Math.random().toString(36).substr(2, 5)}`,
-          questionText: inlineRes.questionText,
-          options: inlineRes.options,
-          correctOptionIndex: -1,
-          explanation: "",
-        };
-      } else {
-        currentQuestion = {
-          id: `q-${num}-${Math.random().toString(36).substr(2, 5)}`,
-          questionText: rest,
-          options: [],
-          correctOptionIndex: -1,
-          explanation: "",
-        };
-      }
-      continue;
-    }
-
-    if (!currentQuestion) {
-      // Tolerate messy text starting lines - if we haven't seen a numbered question title, 
-      // check if it looks like a question or contains options, if so, we auto-create an unnumbered question block
-      if (line.toLowerCase().includes("select the correct") || line.toLowerCase().includes("which is") || line.toLowerCase().includes("find the option")) {
-        currentQuestion = {
-          id: `q-auto-${Math.random().toString(36).substr(2, 5)}`,
-          questionText: line,
-          options: [],
-          correctOptionIndex: -1,
-          explanation: "",
-        };
-      }
-      continue;
-    }
-
-    // Check for Option match
-    const oMatch = line.match(optionRegex);
-    if (oMatch) {
-      const choice = oMatch[1].toUpperCase();
-      const optionContent = oMatch[2] || "";
-      const optIdx = choice.charCodeAt(0) - 65; // A=0, B=1, C=2, D=3
-
-      if (optIdx >= 0 && optIdx < 4) {
-        currentOptionIndex = optIdx;
-        if (!currentQuestion.options) currentQuestion.options = [];
-        currentQuestion.options[optIdx] = optionContent;
-      }
-      continue;
-    }
-
-    // Check for correct key specification
-    const aMatch = line.match(answerRegex);
-    if (aMatch) {
-      const ansLetter = aMatch[1].toUpperCase();
-      const ansIdx = ansLetter.charCodeAt(0) - 65;
-      if (ansIdx >= 0 && ansIdx < 4) {
-        currentQuestion.correctOptionIndex = ansIdx;
-      }
-      continue;
-    }
-
-    // Handle standard line continuation or Explanation keywords
-    if (line.toLowerCase().startsWith("explanation:") || line.toLowerCase().startsWith("exp:") || line.toLowerCase().startsWith("rationale:")) {
-      currentQuestion.explanation = line.replace(/^(?:explanation|exp|rationale)\s*:\s*/i, "");
     } else {
-      if (currentOptionIndex !== -1 && currentQuestion.options) {
-        // Option text continuation
-        currentQuestion.options[currentOptionIndex] = 
-          (currentQuestion.options[currentOptionIndex] || "") + " " + line;
-      } else {
-        // Question text continuation
-        currentQuestion.questionText = (currentQuestion.questionText || "") + " " + line;
-      }
-    }
-  }
-
-  // Flush the last active question
-  flushCurrent();
-
-  // Robust parsing: If we didn't parse any questions using the regex line-by-line model,
-  // but there is text, let's create chunks based on question numbers to extract whatever is there
-  if (questions.length === 0 && text.trim().length > 0) {
-    console.warn("[PDF Parser] Regex parsing failed to find structured questions. Trying secondary chunked extractor.");
-    const numMatches = [...text.matchAll(/(?:\r?\n|^)\s*\(?(\d{1,3})\)?[\.\-\)\s:]+/g)];
-    if (numMatches.length >= 2) {
-      for (let k = 0; k < numMatches.length; k++) {
-        const start = numMatches[k].index!;
-        const end = (k + 1 < numMatches.length) ? numMatches[k + 1].index : text.length;
-        const chunk = text.substring(start, end).trim();
-        if (chunk.length > 10) {
-          const num = numMatches[k][1];
-          // Try to split this chunk by inline options or lines
-          let qText = chunk;
-          let opts: string[] = ["", "", "", ""];
-          const inlineRes = tryExtractInlineOptions(chunk);
-          if (inlineRes) {
-            qText = inlineRes.questionText;
-            opts = inlineRes.options;
-          } else {
-            // Split by lines
-            const chunkLines = chunk.split("\n").map(cl => cl.trim()).filter(Boolean);
-            if (chunkLines.length > 1) {
-              qText = chunkLines[0];
-              let currentOptIdx = 0;
-              for (let ci = 1; ci < chunkLines.length; ci++) {
-                if (currentOptIdx < 4) {
-                  opts[currentOptIdx++] = chunkLines[ci];
-                }
-              }
-            }
+      // Fallback: Split on lines if pattern scoring yields no strong option structure
+      const lines = qContentRaw.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      if (lines.length > 1) {
+        finalQText = lines[0];
+        let currentOptIdx = 0;
+        for (let lIdx = 1; lIdx < lines.length; lIdx++) {
+          const cleanLine = lines[lIdx].replace(/^\s*[-*•]\s*/, "");
+          if (currentOptIdx < 4) {
+            finalOptions[currentOptIdx++] = cleanLine;
+            extractedOptionCount++;
           }
-          questions.push({
-            id: `q-fallback-${num}-${Math.random().toString(36).substr(2, 5)}`,
-            questionText: qText,
-            options: opts,
-            correctOptionIndex: -1,
-            explanation: ""
-          });
         }
       }
     }
+
+    // Capture Correct Answer Index
+    let correctOptionIndex = -1;
+    const answerRegex = /(?:Ans(?:wer)?|Correct(?:\s*Option)?)\s*[:\.\-]?\s*[\(\[=]?([A-Da-d])[\)\]\.]?/i;
+    const ansMatch = chunkText.match(answerRegex);
+    if (ansMatch) {
+      const charLetter = ansMatch[1].toUpperCase();
+      correctOptionIndex = charLetter.charCodeAt(0) - 65;
+    }
+
+    // Capture Explanation / Rationale text
+    let explanation = "";
+    const expRegex = /(?:Explanation|Exp|Rationale)\s*[:\.\-]\s*([\s\S]*)$/i;
+    const expMatch = chunkText.match(expRegex);
+    if (expMatch) {
+      explanation = expMatch[1].trim();
+    }
+
+    // STEP 5: Parse Validation & Safety Checking
+    const isQuestionBlank = finalQText.trim().length === 0;
+    const emptyOptionsCount = finalOptions.filter(o => o.trim().length === 0).length;
+
+    let hasWarning = false;
+    let warningReason = "";
+
+    if (isQuestionBlank) {
+      hasWarning = true;
+      warningReason = "Question description is completely blank.";
+    } else if (extractedOptionCount < 2 || emptyOptionsCount >= 3) {
+      hasWarning = true;
+      warningReason = `Missing multiple-choice options (Extracted only ${extractedOptionCount} options).`;
+    } else if (correctOptionIndex === -1) {
+      hasWarning = true;
+      warningReason = "No correct answer index detected. Specify answer key manually on the card.";
+    }
+
+    if (hasWarning) {
+      failedIndexes.push(idx);
+    }
+
+    questions.push({
+      id: `q-${chunkNumber}-${Math.random().toString(36).substr(2, 5)}`,
+      questionText: finalQText || `[Parsed Empty Question ${idx + 1}]`,
+      options: finalOptions,
+      correctOptionIndex,
+      explanation,
+      hasWarning,
+      warningReason
+    });
+
+    // STEP 7: Debugging logs for segmentation monitoring
+    console.log(`[PDF Parser Chunk ${idx + 1}/${chunks.length}] Q-Num: ${chunkNumber}. Text chars: ${chunkText.length}. Option lengths: [${finalOptions.map(o => o.length).join(", ")}]. Warning: ${hasWarning ? warningReason : "None"}`);
   }
 
+  console.log(`[PDF Parser Segmentation Done] Total: ${questions.length} questions parsed. Flagged Warning Cards: ${failedIndexes.length} (Indexes: [${failedIndexes.join(", ")}]).`);
   return questions;
 }
