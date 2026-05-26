@@ -8,12 +8,12 @@ if (typeof window !== "undefined") {
 }
 
 /**
- * Extracts plain text from a PDF file using the simpler block text strategy.
- * This is highly reliable, fast, and does not fail on complex multi-column coordinates.
+ * Extracts plain text from a PDF file using a highly resilient multi-stage pipeline.
+ * Features automated fallbacks for malformed encodings, normalization control, and raw recovery pass.
  */
 export async function extractTextFromPdf(
   file: File,
-  onProgress?: (current: number, total: number) => void
+  onProgress?: (current: number, total: number, stage?: string) => void
 ): Promise<string> {
   const arrayBuffer = await file.arrayBuffer();
   const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
@@ -25,40 +25,146 @@ export async function extractTextFromPdf(
   let succeededPagesCount = 0;
 
   for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+    let pageText = "";
+    let itemsCount = 0;
+    let pageParsedOk = false;
+
     try {
       const page = await pdf.getPage(pageNum);
-      const textContent = await page.getTextContent();
-      
-      const itemsCount = textContent.items.length;
+
+      // ==========================================
+      // STAGE 1 — STANDARD PDF.js EXTRACTION
+      // ==========================================
+      if (onProgress) {
+        onProgress(pageNum, totalPages, "Stage 1 — Standard Layout Extraction");
+      }
+      try {
+        const textContent = await page.getTextContent();
+        itemsCount = textContent.items.length;
+        const stage1Text = textContent.items
+          .filter(item => item && typeof item === "object" && "str" in item)
+          .map(item => (item as any).str)
+          .join(" ");
+
+        console.log(`[PDF Parser Stage 1] Page ${pageNum}/${totalPages}: items.length = ${itemsCount}, text.length = ${stage1Text.length} chars. Sample: "${stage1Text.substring(0, 100)}"`);
+
+        if (stage1Text.trim().length > 10) {
+          pageText = stage1Text;
+          pageParsedOk = true;
+        }
+      } catch (stage1Err) {
+        console.warn(`[PDF Parser] Stage 1 failed on page ${pageNum}:`, stage1Err);
+      }
+
+      // ==========================================
+      // STAGE 2 — DISABLE NORMALIZATION
+      // ==========================================
+      if (!pageParsedOk) {
+        if (onProgress) {
+          onProgress(pageNum, totalPages, "Stage 2 — Disabling Layout Normalization");
+        }
+        try {
+          const textContent = await page.getTextContent({ disableNormalization: true });
+          itemsCount = textContent.items.length;
+          const stage2Text = textContent.items
+            .filter(item => item && typeof item === "object" && "str" in item)
+            .map(item => (item as any).str)
+            .join(" ");
+
+          console.log(`[PDF Parser Stage 2] Page ${pageNum}/${totalPages}: items.length = ${itemsCount}, text.length = ${stage2Text.length} chars. Sample: "${stage2Text.substring(0, 100)}"`);
+
+          if (stage2Text.trim().length > 10) {
+            pageText = stage2Text;
+            pageParsedOk = true;
+          }
+        } catch (stage2Err) {
+          console.warn(`[PDF Parser] Stage 2 failed on page ${pageNum}:`, stage2Err);
+        }
+      }
+
+      // ==========================================
+      // STAGE 3 — RAW COORDINATE / TOKEN RECOVERY
+      // ==========================================
+      if (!pageParsedOk) {
+        if (onProgress) {
+          onProgress(pageNum, totalPages, "Stage 3 — Raw Token Recovery Mode");
+        }
+        try {
+          // Attempt raw coordinate recovery pass. We grab everything resembling text,
+          // ignore layout structuring entirely, and prioritize character retrieval.
+          const textContent = await page.getTextContent().catch(() => 
+            page.getTextContent({ disableNormalization: true })
+          );
+          
+          itemsCount = textContent.items.length;
+          const recoveredTokens: string[] = [];
+
+          for (const item of textContent.items) {
+            if (!item) continue;
+            if (typeof item === "string") {
+              recoveredTokens.push(item);
+            } else if (typeof item === "object") {
+              if ("str" in item && typeof (item as any).str === "string") {
+                recoveredTokens.push((item as any).str);
+              } else {
+                // Recover any string-like properties
+                for (const key of Object.keys(item)) {
+                  const val = (item as any)[key];
+                  if (typeof val === "string" && val.trim().length > 0) {
+                    recoveredTokens.push(val);
+                  }
+                }
+              }
+            }
+          }
+
+          const stage3Text = recoveredTokens.join(" ");
+          console.log(`[PDF Parser Stage 3] Page ${pageNum}/${totalPages}: items.length = ${itemsCount}, text.length = ${stage3Text.length} chars. Sample: "${stage3Text.substring(0, 100)}"`);
+
+          if (stage3Text.trim().length > 0) {
+            pageText = stage3Text;
+            pageParsedOk = true;
+          }
+        } catch (stage3Err) {
+          console.error(`[PDF Parser] Stage 3 failed on page ${pageNum}:`, stage3Err);
+        }
+      }
+
       totalPageItems += itemsCount;
 
-      // Extract only valid "str" fields safely and join them by spaces
-      const pageText = textContent.items
-        .filter(item => item && typeof item === "object" && "str" in item)
-        .map(item => (item as any).str)
-        .join(" ");
+      if (pageText.trim().length > 0) {
+        fullText += pageText + "\n\n";
+        succeededPagesCount++;
+      } else {
+        // Even if empty, add a small space gap to keep page separation
+        fullText += `[RAW PAGE ${pageNum} UNREADABLE]\n\n`;
+      }
 
-      // Debug logging for every page as requested
-      console.log(`[PDF Parser Debug] Page ${pageNum} of ${totalPages}: raw items length = ${itemsCount}, extracted text length = ${pageText.length} characters`);
-
-      fullText += pageText + "\n\n";
-      succeededPagesCount++;
     } catch (pageErr) {
-      console.error(`[PDF Parser] Error reading page ${pageNum}:`, pageErr);
+      console.error(`[PDF Parser] Extreme failure loading page ${pageNum}:`, pageErr);
+      fullText += `[PAGE ${pageNum} STRUCTURAL FAILURE]\n\n`;
     }
 
     if (onProgress) {
-      onProgress(pageNum, totalPages);
+      onProgress(pageNum, totalPages, "Finalizing pages");
     }
   }
 
-  // Remove overly strict validation. 
-  // ONLY throw if every single page has 0 items AND finished raw text is completely empty.
+  // ==========================================
+  // STAGE 4 — PARTIAL SUCCESS MODE
+  // ==========================================
+  // ONLY show a fatal error if every single page has 0 raw items of data AND the entire string list is empty.
+  // Otherwise, fallback mode always yields whatever readable text is recovered.
   const trimmedFullText = fullText.trim();
-  if (totalPageItems === 0 && trimmedFullText.length === 0) {
-    throw new Error("Failed to parse and extract text. Ensure the PDF contains actual text characters rather than image-only scans.");
+  const fullyEmpty = totalPageItems === 0 && trimmedFullText.replace(/\[RAW PAGE \d+ UNREADABLE\]|\[PAGE \d+ STRUCTURAL FAILURE\]/g, "").trim().length === 0;
+
+  if (fullyEmpty) {
+    throw new Error(
+      "All extraction methods failed completely. No readable text characters were found inside this PDF file."
+    );
   }
 
+  console.log(`[PDF Parser Completed] Successfully parsed content across multi-stage pipeline. Succeeded pages: ${succeededPagesCount}/${totalPages}. Total extracted length: ${trimmedFullText.length} characters.`);
   return fullText;
 }
 

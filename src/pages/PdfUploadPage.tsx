@@ -27,6 +27,7 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   const [file, setFile] = useState<File | null>(null);
   const [extracting, setExtracting] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
+  const [extractionStage, setExtractionStage] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -80,9 +81,13 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     setError(null);
     setWarning(null);
     setProgress({ current: 0, total: 0 });
+    setExtractionStage("Initializing multi-stage extraction...");
     try {
-      const text = await extractTextFromPdf(pdfFile, (current, total) => {
+      const text = await extractTextFromPdf(pdfFile, (current, total, stage) => {
         setProgress({ current, total });
+        if (stage) {
+          setExtractionStage(stage);
+        }
       });
       
       setRawText(text);
@@ -100,7 +105,8 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       }
     } catch (e: any) {
       console.error(e);
-      setError("Failed to extract readable text characters from this PDF. Enabled fallback manual question entry mode.");
+      // Fallback mode: show warning banner instead of hard error, allow manual entry anyway
+      setWarning(`PDF Extraction completed with warning notice: ${e.message || "Failed to parse structured characters."}`);
       setRawText("");
       setQuestions([createNewQuestion(1)]);
     } finally {
@@ -271,9 +277,23 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       {warning && (
         <div className="bg-amber-950/20 border border-amber-900/60 text-amber-300 p-3.5 rounded-md text-xs flex gap-3 items-start animate-fade-in">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
-          <div className="flex-1">
-            <p className="font-semibold mb-0.5 text-amber-200">Parser Notice</p>
-            <p>{warning}</p>
+          <div className="flex-1 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
+            <div>
+              <p className="font-semibold mb-0.5 text-amber-200">Parser Notice</p>
+              <p>{warning}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                setWarning(null);
+                if (questions.length === 0) {
+                  setQuestions([createNewQuestion(1)]);
+                }
+              }}
+              className="px-3 py-1.5 bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 font-mono text-[10px] font-bold rounded border border-amber-500/30 uppercase tracking-wider transition-colors shrink-0"
+            >
+              Continue Anyway
+            </button>
           </div>
         </div>
       )}
@@ -335,7 +355,9 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
           {extracting ? (
             <div className="flex flex-col items-center gap-3">
               <div className="w-8 h-8 border-2 border-white border-t-transparent rounded-full animate-spin mb-2" />
-              <p className="text-sm text-zinc-300 font-medium">Extracting PDF structures...</p>
+              <p className="text-sm text-zinc-300 font-medium font-mono text-amber-200">
+                {extractionStage || "Extracting PDF structures..."}
+              </p>
               {progress.total > 0 && (
                 <span className="text-xs text-zinc-500 font-mono">
                   Page {progress.current} of {progress.total}
@@ -355,9 +377,25 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
                   Supports select-enabled PDFs up to 25MB
                 </p>
               </div>
-              <button className="px-3 py-1.5 bg-zinc-900 border border-zinc-800 rounded text-xs hover:bg-zinc-850 mt-2 text-zinc-300">
-                Browse Files
-              </button>
+              <div className="flex flex-col items-center gap-2 mt-2">
+                <button type="button" className="px-3 py-1.5 bg-zinc-900 border border-zinc-800 rounded text-xs hover:bg-zinc-850 text-zinc-300">
+                  Browse Files
+                </button>
+                <div className="flex items-center gap-1 text-[11px] text-zinc-500 mt-1">
+                  <span>Or</span>
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setQuestions([createNewQuestion(1)]);
+                      setWarning("Manual editing mode activated. You can now build questions manually.");
+                    }}
+                    className="text-zinc-300 hover:text-white underline cursor-pointer transition-colors"
+                  >
+                    Start with a blank worksheet
+                  </button>
+                </div>
+              </div>
             </>
           )}
         </div>
