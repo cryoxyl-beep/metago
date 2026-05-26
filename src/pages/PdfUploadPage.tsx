@@ -4,7 +4,6 @@ import { extractTextFromPdf, parseQuestionsFromText, assessChunkConfidence } fro
 import { Question, QuestionSet } from "../types";
 import { collection, doc, writeBatch, Timestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase/config";
-import { GoogleGenAI, Type } from "@google/genai";
 import { 
   FileText, 
   Upload, 
@@ -119,24 +118,18 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     setExtractionStage(`Applying AI recovery to ${malformedChunks.length} malformed question blocks...`);
 
     try {
-      const apiKey = (import.meta as any).env.VITE_GEMINI_API_KEY;
-      if (!apiKey || apiKey.trim() === "" || apiKey === "YOUR_GEMINI_API_KEY") {
-        console.warn("[Gemini Client] VITE_GEMINI_API_KEY is not configured or left as placeholder in environment variables.");
-        throw new Error("Missing VITE_GEMINI_API_KEY. Please provide the key in the settings panel or .env file.");
+      const apiKey = (import.meta as any).env.VITE_GROQ_API_KEY;
+      if (!apiKey || apiKey.trim() === "" || apiKey === "YOUR_GROQ_API_KEY") {
+        console.warn("[Groq Client] VITE_GROQ_API_KEY is not configured or left as placeholder in environment variables.");
+        throw new Error("Missing VITE_GROQ_API_KEY. Please provide the key in the settings panel or .env file.");
       }
 
-      // Log: Gemini request started
-      // Log: malformed chunk count
-      console.log(`[Gemini Request] Started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
+      // 1. Log: Groq request started (malformed chunk count)
+      console.log(`[Groq Client] Request started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
 
-      const ai = new GoogleGenAI({
-        apiKey: apiKey,
-        httpOptions: {
-          headers: {
-            "User-Agent": "aistudio-build"
-          }
-        }
-      });
+      // 2. Log: Active model string used
+      const activeModel = "qwen-2.5-coder-32b";
+      console.log(`[Groq Client] Active model string used: ${activeModel}`);
 
       // Batch 3 to 5 malformed chunks maximum per request
       const batchSize = 4;
@@ -145,90 +138,85 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
         batches.push(malformedChunks.slice(i, i + batchSize));
       }
 
-      console.log(`[Gemini Client] Batching ${malformedChunks.length} malformed chunks into ${batches.length} requests (size: ${batchSize}).`);
+      console.log(`[Groq Client] Batching ${malformedChunks.length} chunks into ${batches.length} groups of size ${batchSize}.`);
 
       const batchPromises = batches.map(async (batch, batchIdx) => {
         const userPrompt = `Reconstruct the following mangled multiple choice question blocks from a PDF reading extraction.
 Separate any merged questions if they got lumped together. Isolate options correctly (A, B, C, D) and preserve the wording, equations, and symbols.
 Do not invent any details or answers or explanations that are not present in the source text.
-If no answer key is clearly mentioned, keep "correct_option_index" as null.
-If there is no explanation, keep "explanation" as an empty string.
+Keep "correct_option_index" as null.
+Keep "explanation" as an empty string.
 
 --- START QUESTION BLOCKS TO RECONSTRUCT ---
 ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
 --- END QUESTION BLOCKS ---`;
 
-        console.log(`[Gemini Client] Requesting batch ${batchIdx + 1} of ${batches.length}...`);
+        console.log(`[Groq Client] Fetching batch ${batchIdx + 1} of ${batches.length} from Groq...`);
 
-        const payloadConfig = {
-          contents: userPrompt,
-          config: {
-            systemInstruction: "You are an expert curriculum assistant specializing in PDF reading recovery. Your sole job is to clean, separate, and reconstruct malformed question blocks into JSON format. Do not make up answers, do not speculate explanations, and do not invent content. Always preserve exact math equations, symbols, and formatting where possible.",
-            responseMimeType: "application/json",
-            responseSchema: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  question_text: { 
-                    type: Type.STRING,
-                    description: "The complete visual text of the question, preserving symbols." 
-                  },
-                  options: {
-                    type: Type.ARRAY,
-                    items: { type: Type.STRING },
-                    description: "The 4 options for multiple choices (A, B, C, D). If fewer are present, pad with empty strings."
-                  },
-                  correct_option_index: { 
-                    type: Type.INTEGER, 
-                    description: "Index (0 to 3) matching A to D. Null if not specified or unclear in the source chunk."
-                  },
-                  explanation: { 
-                    type: Type.STRING,
-                    description: "Explanation details if found. Empty string if none is present."
-                  }
-                },
-                required: ["question_text", "options", "correct_option_index", "explanation"]
-              }
-            }
-          }
-        };
+        const systemMessage = `You are an expert curriculum assistant specializing in PDF reading recovery. Your sole job is to clean, separate, and reconstruct malformed question blocks into JSON format. Do not make up answers, do not speculate explanations, and do not invent content. Always preserve exact math equations, symbols, and formatting where possible.
+You MUST reply with a JSON object containing a "questions" key containing an array of reconstructed question items in this exact schema format:
+{
+  "questions": [
+    {
+      "question_text": "string",
+      "options": ["string", "string", "string", "string"],
+      "correct_option_index": null,
+      "explanation": ""
+    }
+  ]
+}`;
 
-        let response;
-        try {
-          console.log(`[Gemini Client] Attempting generation with active model: gemini-2.5-flash (Batch ${batchIdx + 1} of ${batches.length})`);
-          response = await ai.models.generateContent({
-            model: "gemini-2.5-flash",
-            ...payloadConfig
-          });
-        } catch (firstTryError: any) {
-          console.warn(`[Gemini Client] Active model (gemini-2.5-flash) failed for batch ${batchIdx + 1}.`);
-          console.warn(`[Gemini Client] Model failure reason:`, firstTryError?.message || firstTryError);
-          console.log(`[Gemini Client] Fallback model usage triggered. Retrying batch ${batchIdx + 1} using fallback model: gemini-flash-latest`);
-          
-          try {
-            response = await ai.models.generateContent({
-              model: "gemini-flash-latest",
-              ...payloadConfig
-            });
-          } catch (secondTryError: any) {
-            console.error(`[Gemini Client] Both active and fallback model requests failed for batch ${batchIdx + 1}:`, secondTryError?.message || secondTryError);
-            throw secondTryError;
-          }
+        const startTime = performance.now();
+
+        const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${apiKey}`
+          },
+          body: JSON.stringify({
+            model: activeModel,
+            messages: [
+              { role: "system", content: systemMessage },
+              { role: "user", content: userPrompt }
+            ],
+            temperature: 0.1,
+            response_format: { type: "json_object" }
+          })
+        });
+
+        const nativeLatency = performance.now() - startTime;
+        // 3. Log: Native response latency (ms)
+        console.log(`[Groq Client] Native response latency for batch ${batchIdx + 1}: ${nativeLatency.toFixed(2)} ms. HTTP Status: ${response.status}`);
+
+        if (!response.ok) {
+          const errText = await response.text();
+          throw new Error(`Groq API returned failure status ${response.status}: ${errText}`);
         }
 
-        // Log: Gemini response received
-        const responseText = response.text || "[]";
-        console.log(`[Gemini Client] Response received for batch ${batchIdx + 1}. Raw length: ${responseText.length}`);
+        const responseData = await response.json();
+        const responseText = responseData?.choices?.[0]?.message?.content || "{}";
 
         try {
           const parsedGroup = JSON.parse(responseText.trim());
-          // Log: JSON parse success
-          console.log(`[Gemini Client] JSON parse success for batch ${batchIdx + 1}. Reconstructed ${parsedGroup.length} items.`);
-          return parsedGroup;
+          // 4. Log: JSON parsing success
+          console.log(`[Groq Client] JSON parsing success status for batch ${batchIdx + 1}.`);
+
+          let list: any[] = [];
+          if (Array.isArray(parsedGroup)) {
+            list = parsedGroup;
+          } else if (parsedGroup && Array.isArray(parsedGroup.questions)) {
+            list = parsedGroup.questions;
+          } else if (parsedGroup && typeof parsedGroup === "object") {
+            const firstArrayKey = Object.keys(parsedGroup).find(k => Array.isArray((parsedGroup as any)[k]));
+            if (firstArrayKey) {
+              list = (parsedGroup as any)[firstArrayKey];
+            }
+          }
+          return list;
         } catch (jsonErr) {
-          // Log: JSON parse failure
-          console.error(`[Gemini Client] JSON parse failure for batch ${batchIdx + 1}:`, responseText, jsonErr);
+          // 4. Log: JSON parsing failure
+          console.error(`[Groq Client] JSON parsing failure status for batch ${batchIdx + 1}:`, responseText, jsonErr);
           throw jsonErr;
         }
       });
@@ -282,7 +270,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
         setWarning(`AI cleanup recovery applied to malformed question blocks. Reconstructed ${aiQuestions.length} questions semantically from mangled PDF layout.`);
       }
     } catch (apiErr: any) {
-      console.warn("[Gemini Client Fallback] direct model request failed:", apiErr);
+      console.warn("[Groq Fallback] direct model request failed:", apiErr);
       setQuestions(initialQuestions);
       setAiCleanedCount(0);
       setWarning(`Notice: AI-powered recovery was bypassed (${apiErr.message || "Invalid API key or network block"}). Reverting to default regex parsed result.`);
@@ -532,7 +520,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
               <div className="bg-emerald-555 h-full w-1/3 rounded-full animate-pulse" />
             </div>
             <p className="text-[10px] text-zinc-500 font-mono">
-              Running gemini-3.5-flash semantic recovery
+              Running Qwen 2.5 Coder 32B semantic recovery on Groq
             </p>
           </div>
         </div>
