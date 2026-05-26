@@ -12,7 +12,6 @@ import {
   ChevronRight, 
   PlusCircle, 
   AlertCircle, 
-  Activity, 
   Play,
   RotateCcw
 } from "lucide-react";
@@ -241,10 +240,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
           <span className="text-xs text-zinc-500">Fetching records...</span>
         </div>
       ) : (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
+        <div className="flex flex-col gap-8">
           
           {/* Left / Center Grid (Tables) */}
-          <div className="lg:col-span-2 flex flex-col gap-8">
+          <div className="flex flex-col gap-8 w-full">
             
             {/* Uploaded PDF Question Sets Module */}
             <div className="flex flex-col gap-3">
@@ -397,36 +396,6 @@ export const Dashboard: React.FC<DashboardProps> = ({
               )}
             </div>
 
-          </div>
-
-          {/* Right Column / Recent Activity Stream */}
-          <div className="flex flex-col gap-3">
-            <h3 className="text-sm font-semibold tracking-wide text-zinc-200 flex items-center gap-2">
-              <Activity className="w-4 h-4 text-zinc-500" />
-              <span>Prep Activity Log</span>
-            </h3>
-
-            <div className="border border-zinc-900 bg-zinc-950 p-4 rounded-lg flex flex-col gap-4">
-              {activities.length === 0 ? (
-                <p className="text-xs text-zinc-500 py-4 text-center">No recent entries log.</p>
-              ) : (
-                <div className="flex flex-col gap-4">
-                  {activities.map((act, i) => (
-                    <div key={i} className="flex gap-3 items-start text-xs border-b border-zinc-900/60 last:border-0 pb-3">
-                      <div className="w-1.5 h-1.5 rounded-full bg-zinc-500 mt-1.5 shrink-0" />
-                      <div className="flex flex-col">
-                        <span className="font-semibold text-zinc-300 text-[11px] leading-tight">
-                          {act.title}
-                        </span>
-                        <span className="text-[9px] text-zinc-500 font-mono mt-0.5">
-                          {act.meta} &bull; {new Date(act.date).toLocaleDateString()}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
           </div>
 
         </div>
