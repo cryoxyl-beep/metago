@@ -63,6 +63,7 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   } | null>(null);
 
   const [showDebugPanel, setShowDebugPanel] = useState<boolean>(false);
+  const [selectedModel, setSelectedModel] = useState<string>("gemini-3.1-flash-lite");
 
   // Handle local PDF upload
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -129,8 +130,30 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     }
 
     setGeminiDebug(null); // Clear previous debug info
+
+    // If regex-only-mode selected, skip all AI cleanup entirely
+    if (selectedModel === "regex-only-mode") {
+      console.log(`[AI Performance Telemetry] Regex-only mode selected. Skipping all AI cleanup.
+      - Selected Model: ${selectedModel}
+      - Success State: true
+      `);
+      setQuestions(initialQuestions);
+      setAiCleanedCount(0);
+      return initialQuestions;
+    }
+
     setIsAiCleaning(true);
-    setExtractionStage("Gemini 3.1-lite semantic cleanup running...");
+
+    // Setting active model name visibly during parsing
+    let modelLabel = selectedModel;
+    if (selectedModel === "gemini-3.1-flash-lite") modelLabel = "Gemini 3.1 Flash Lite";
+    else if (selectedModel === "gemini-3.5-flash") modelLabel = "Gemini 3.5 Flash";
+    else if (selectedModel === "gemini-2.5-flash") modelLabel = "Gemini 2.5 Flash";
+    else if (selectedModel === "gemini-2.0-flash") modelLabel = "Gemini 2.0 Flash";
+    else if (selectedModel === "qwen/qwen3-32b") modelLabel = "Groq Qwen3";
+    else if (selectedModel === "llama-3.3-70b-versatile") modelLabel = "Groq Llama";
+
+    setExtractionStage(`Using ${modelLabel}...`);
 
     try {
       const geminiApiKey = (import.meta as any).env.VITE_GEMINI_API_KEY;
@@ -139,27 +162,52 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       const hasGemini = geminiApiKey && geminiApiKey.trim() !== "" && geminiApiKey !== "YOUR_GEMINI_API_KEY";
       const hasGroq = groqApiKey && groqApiKey.trim() !== "" && groqApiKey !== "YOUR_GROQ_API_KEY";
 
-      if (!hasGemini && !hasGroq) {
-        const errMsg = "Missing API Keys (Gemini/Groq). Please specify keys in the settings panel or .env file.";
-        console.warn("[AI Cleanup] No valid VITE_GEMINI_API_KEY or VITE_GROQ_API_KEY provided.");
+      const isGemini = selectedModel.startsWith("gemini-");
+
+      if (isGemini && !hasGemini) {
+        const errMsg = "Missing VITE_GEMINI_API_KEY. Please specify it in the settings panel or .env file.";
+        console.warn("[AI Cleanup] No valid VITE_GEMINI_API_KEY configured.");
         
         setGeminiDebug({
-          modelName: "gemini-3.1-flash-lite",
+          modelName: selectedModel,
           statusCode: null,
-          rawResponse: "No prompt sent - missing API keys configuration inside environment.",
+          rawResponse: "No prompt sent - missing API keys configuration.",
           parsedError: { error: "Missing API Key", message: errMsg },
           malformedChunksCount: malformedChunks.length,
           durationMs: 0,
-          endpoint: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite:generateContent?key=undefined",
+          endpoint: `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=undefined`,
           requestPayload: null,
           errorOccurred: true,
           errorMessage: errMsg
         });
-
         throw new Error(errMsg);
       }
 
-      console.log(`[AI Pipeline] Request started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
+      if (!isGemini && !hasGroq) {
+        const errMsg = "Missing VITE_GROQ_API_KEY. Please specify it in the settings panel or .env file.";
+        console.warn("[AI Cleanup] No valid VITE_GROQ_API_KEY configured.");
+        
+        setGeminiDebug({
+          modelName: selectedModel,
+          statusCode: null,
+          rawResponse: "No prompt sent - missing API keys configuration.",
+          parsedError: { error: "Missing API Key", message: errMsg },
+          malformedChunksCount: malformedChunks.length,
+          durationMs: 0,
+          endpoint: "https://api.groq.com/openai/v1/chat/completions",
+          requestPayload: null,
+          errorOccurred: true,
+          errorMessage: errMsg
+        });
+        throw new Error(errMsg);
+      }
+
+      // Step 7: Telemetry Started Log
+      console.log(`[AI Performance Telemetry] Request Started:
+      - Selected Model: ${selectedModel}
+      - Provider: ${isGemini ? "Gemini" : "Groq"}
+      - Malformed Chunk Count: ${malformedChunks.length}
+      `);
 
       // STEP 4: Limit malformed reconstruction batches to: MAXIMUM 2 QUESTIONS PER CHUNK
       const batchSize = 2;
@@ -174,166 +222,124 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       const systemMessage = `You are an expert curriculum assistant. Clean and reconstruct malformed question blocks into JSON. Restore equations and layout. Preserve content without inventing answers. Output JSON with a "questions" key matching this schema:
 {"questions": [{"question_text": "text", "options": ["str", "str", "str", "str"], "correct_option_index": null, "explanation": ""}]}`;
 
-      const processBatchWithFallback = async (batch: string[], batchIdx: number) => {
+      const processBatchWithSelectedModel = async (batch: string[], batchIdx: number) => {
         const userPrompt = `JSON-repair these malformed PDF question blocks:
 ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
 
-        // STEP 2: Priority Order:
-        // 1. gemini-3.1-flash-lite
-        // 2. gemini-3.5-flash
-        // 3. gemini-2.5-flash
-        // 4. Groq Qwen3 (qwen/qwen3-32b)
-        // 5. Groq Llama (llama-3.3-70b-versatile)
-        const providers = [
-          { type: "gemini", model: "gemini-3.1-flash-lite", label: "Gemini 3.1-lite semantic cleanup running..." },
-          { type: "gemini", model: "gemini-3.5-flash", label: "Upgrading to Gemini 3.5..." },
-          { type: "gemini", model: "gemini-2.5-flash", label: "Upgrading to Gemini 2.5..." },
-          { type: "groq", model: "qwen/qwen3-32b", label: "Gemini rate limit reached, switching to Groq fallback..." },
-          { type: "groq", model: "llama-3.3-70b-versatile", label: "Groq semantic recovery active..." }
-        ];
-
-        let success = false;
-        let responseText = "";
-        let finalModelUsed = "";
-        const errorsList: string[] = [];
-        let duration = 0;
+        const startTime = performance.now();
         let finalStatus: number | null = null;
+        let responseText = "";
         let lastPayload: any = null;
         let lastEndpoint = "";
 
-        for (let pIdx = 0; pIdx < providers.length; pIdx++) {
-          const provider = providers[pIdx];
-          
-          if (provider.type === "gemini" && !hasGemini) continue;
-          if (provider.type === "groq" && !hasGroq) continue;
+        if (isGemini) {
+          const endpointUrl = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${geminiApiKey}`;
+          lastEndpoint = endpointUrl;
 
-          setExtractionStage(provider.label);
-          console.log(`[AI Pipeline] Attempting Batch ${batchIdx + 1} with ${provider.model}...`);
-          const startTime = performance.now();
-
-          try {
-            if (provider.type === "gemini") {
-              const endpointUrl = `https://generativelanguage.googleapis.com/v1beta/models/${provider.model}:generateContent?key=${geminiApiKey}`;
-              lastEndpoint = endpointUrl;
-
-              // STEP 3: thinking_config: { thinking_level: "low" }
-              const requestPayload = {
-                systemInstruction: { parts: [{ text: systemMessage }] },
-                contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
-                generationConfig: { 
-                  responseMimeType: "application/json",
-                  thinkingConfig: {
-                    thinkingBudget: 0
-                  },
-                  thinking_config: {
-                    thinking_level: "low"
-                  }
-                }
-              };
-              lastPayload = requestPayload;
-
-              // Log details to console
-              console.log(`[Performance Diagnostics] Endpoint:`, lastEndpoint);
-              console.log(`[Performance Diagnostics] Request Payload:`, JSON.stringify(lastPayload, null, 2));
-
-              const response = await fetch(endpointUrl, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(requestPayload)
-              });
-
-              duration = performance.now() - startTime;
-              finalStatus = response.status;
-              responseText = await response.text();
-
-              console.log(`[Performance Diagnostics] API Response status (${provider.model}):`, response.ok, response.status);
-              console.log(`[Performance Diagnostics] Raw API response output:`, responseText);
-
-              if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${responseText}`);
+          // STEP 3: thinking_config: { thinking_level: "low" }
+          const requestPayload = {
+            systemInstruction: { parts: [{ text: systemMessage }] },
+            contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
+            generationConfig: { 
+              responseMimeType: "application/json",
+              thinkingConfig: {
+                thinkingBudget: 0
+              },
+              thinking_config: {
+                thinking_level: "low"
               }
-
-              const data = JSON.parse(responseText);
-              const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
-              if (!textResult) {
-                const finishReason = data.candidates?.[0]?.finishReason || "No candidates found";
-                throw new Error(`Empty contents or candidate blocked on ${provider.model}. Finish reason: ${finishReason}`);
-              }
-
-              responseText = textResult;
-              finalModelUsed = provider.model;
-              success = true;
-              console.log(`[AI Pipeline] Successful execution using ${provider.model} in ${duration.toFixed(1)}ms.`);
-              break;
-            } else {
-              // Groq Chat Comp
-              const endpointUrl = "https://api.groq.com/openai/v1/chat/completions";
-              lastEndpoint = endpointUrl;
-              const requestPayload = {
-                model: provider.model,
-                messages: [
-                  { role: "system", content: systemMessage },
-                  { role: "user", content: userPrompt }
-                ],
-                temperature: 0.1,
-                response_format: { type: "json_object" }
-              };
-              lastPayload = requestPayload;
-
-              console.log(`[Performance Diagnostics] Endpoint:`, lastEndpoint);
-              console.log(`[Performance Diagnostics] Request Payload:`, JSON.stringify(lastPayload, null, 2));
-
-              const response = await fetch(endpointUrl, {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  "Authorization": `Bearer ${groqApiKey}`
-                },
-                body: JSON.stringify(requestPayload)
-              });
-
-              duration = performance.now() - startTime;
-              finalStatus = response.status;
-              const textResult = await response.text();
-              responseText = textResult;
-
-              console.log(`[Performance Diagnostics] API Response status (${provider.model}):`, response.ok, response.status);
-              console.log(`[Performance Diagnostics] Raw API response output:`, responseText);
-
-              if (!response.ok) {
-                throw new Error(`HTTP ${response.status}: ${responseText}`);
-              }
-
-              const responseData = JSON.parse(textResult);
-              const content = responseData?.choices?.[0]?.message?.content;
-              if (!content) {
-                throw new Error("Empty message content returned from Groq chat completion API");
-              }
-
-              responseText = content;
-              finalModelUsed = provider.model;
-              success = true;
-              console.log(`[AI Pipeline] Successful execution using Groq / ${provider.model} in ${duration.toFixed(1)}ms.`);
-              break;
             }
-          } catch (err: any) {
-            const timeTaken = performance.now() - startTime;
-            const errMsg = err?.message || String(err);
-            console.warn(`[AI Timing / Switch] Batch ${batchIdx + 1} failed on provider ${provider.model} after ${timeTaken.toFixed(1)}ms. Error: ${errMsg}`);
-            errorsList.push(`${provider.model}: ${errMsg}`);
+          };
+          lastPayload = requestPayload;
+
+          const response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestPayload)
+          });
+
+          finalStatus = response.status;
+          responseText = await response.text();
+
+          const isRateLimit = response.status === 429 || 
+            responseText.toLowerCase().includes("quota") || 
+            responseText.toLowerCase().includes("limit exceeded") || 
+            responseText.toLowerCase().includes("rate limit") || 
+            responseText.toLowerCase().includes("rate_limit");
+
+          if (isRateLimit) {
+            throw new Error("Selected model is currently rate-limited. Try another provider/model.");
           }
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${responseText}`);
+          }
+
+          const data = JSON.parse(responseText);
+          const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (!textResult) {
+            const finishReason = data.candidates?.[0]?.finishReason || "No candidates found";
+            throw new Error(`Empty contents or candidate blocked on ${selectedModel}. Finish reason: ${finishReason}`);
+          }
+
+          responseText = textResult;
+        } else {
+          // Groq Endpoint Route
+          const endpointUrl = "https://api.groq.com/openai/v1/chat/completions";
+          lastEndpoint = endpointUrl;
+
+          const requestPayload = {
+            model: selectedModel,
+            messages: [
+              { role: "system", content: systemMessage },
+              { role: "user", content: userPrompt }
+            ],
+            temperature: 0.1,
+            response_format: { type: "json_object" }
+          };
+          lastPayload = requestPayload;
+
+          const response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": `Bearer ${groqApiKey}`
+            },
+            body: JSON.stringify(requestPayload)
+          });
+
+          finalStatus = response.status;
+          responseText = await response.text();
+
+          const isRateLimit = response.status === 429 || 
+            responseText.toLowerCase().includes("quota") || 
+            responseText.toLowerCase().includes("limit exceeded") || 
+            responseText.toLowerCase().includes("rate limit") || 
+            responseText.toLowerCase().includes("rate_limit");
+
+          if (isRateLimit) {
+            throw new Error("Selected model is currently rate-limited. Try another provider/model.");
+          }
+
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}: ${responseText}`);
+          }
+
+          const responseData = JSON.parse(responseText);
+          const content = responseData?.choices?.[0]?.message?.content;
+          if (!content) {
+            throw new Error("Empty message content returned from Groq API");
+          }
+
+          responseText = content;
         }
 
-        if (!success) {
-          throw new Error(`All semantic reconstitution models failed to process batch ${batchIdx + 1}:\n${errorsList.join("\n")}`);
-        }
-
+        const duration = performance.now() - startTime;
         let parsedGroup: any;
         try {
           parsedGroup = JSON.parse(responseText.trim());
-          console.log(`[AI Pipeline] JSON parsing success for batch ${batchIdx + 1}`);
         } catch (jsonErr: any) {
-          console.error(`[AI Parser] JSON Parse failure on restored text of batch ${batchIdx + 1}:`, responseText, jsonErr);
+          console.error(`[AI Parser] JSON Parse failure on restored text or chunk:`, responseText, jsonErr);
           throw jsonErr;
         }
 
@@ -351,7 +357,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
 
         if (batchIdx === batches.length - 1) {
           setGeminiDebug({
-            modelName: finalModelUsed,
+            modelName: selectedModel,
             statusCode: finalStatus,
             rawResponse: responseText,
             parsedError: null,
@@ -364,7 +370,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
           });
         }
 
-        return { list, finalModelUsed, durationMs: duration };
+        return { list, durationMs: duration };
       };
 
       // STEP 5: Parallel request execution with controlled concurrency (Limit to 2 simultaneous requests)
@@ -376,7 +382,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
         const currentGroup = batches.slice(i, i + concurrencyLimit);
         const groupPromises = currentGroup.map((batch, subIdx) => {
           const batchIndex = i + subIdx;
-          return processBatchWithFallback(batch, batchIndex);
+          return processBatchWithSelectedModel(batch, batchIndex);
         });
 
         const groupResults = await Promise.all(groupPromises);
@@ -392,7 +398,16 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
       }
 
       const totalDuration = performance.now() - startTimeTotal;
-      console.log(`[AI Performance Telemetry] Total semantic reconstruction duration: ${totalDuration.toFixed(1)}ms. Batches processed: ${batches.length}. Average batch timings: ${(totalDuration / batches.length).toFixed(1)}ms.`);
+      
+      // Step 7: Telemetry succeeded log
+      console.log(`[AI Performance Telemetry] Request Succeeded:
+      - Selected Model: ${selectedModel}
+      - Provider: ${isGemini ? "Gemini" : "Groq"}
+      - Request Latency (Total): ${totalDuration.toFixed(1)} ms
+      - Malformed Chunks Repaired: ${malformedChunks.length}
+      - Average Batch Timing: ${(totalDuration / batches.length).toFixed(1)} ms
+      - Success State: true
+      `);
 
       const aiQuestions: Question[] = combinedResults.map((q: any, index: number) => {
         const options = Array.isArray(q.options) ? q.options : ["", "", "", ""];
@@ -443,9 +458,42 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
       return finalQuestionsList;
     } catch (apiErr: any) {
       console.warn("[AI STRICT COMBINED PIPELINE] Semantic cleanup request failed:", apiErr);
+
+      const isRateLimitError = apiErr.message && apiErr.message.toLowerCase().includes("rate-limited");
+      const isGemini = selectedModel.startsWith("gemini-");
+
+      setGeminiDebug({
+        modelName: selectedModel,
+        statusCode: apiErr.message?.includes("HTTP") ? parseInt(apiErr.message.match(/\d+/)?.[0] || "429") : 429,
+        rawResponse: apiErr.message || "Request failed with error",
+        parsedError: { error: apiErr.name || "Error", message: apiErr.message },
+        malformedChunksCount: malformedChunks.length,
+        durationMs: 0,
+        endpoint: isGemini 
+          ? `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=...` 
+          : "https://api.groq.com/openai/v1/chat/completions",
+        requestPayload: { selectedModel },
+        errorOccurred: true,
+        errorMessage: apiErr.message || "Unknown API disruption occurred."
+      });
+
       setQuestions(initialQuestions);
       setAiCleanedCount(0);
-      setWarning(`Notice: AI-powered recovery was bypassed with errors (${apiErr.message || "Invalid API keys or network blocks"}). Reverting to default regex parsed result.`);
+
+      // Step 7: Telemetry failed log
+      console.log(`[AI Performance Telemetry] Request Failed:
+      - Selected Model: ${selectedModel}
+      - Provider: ${isGemini ? "Gemini" : "Groq"}
+      - Malformed Chunk Count: ${malformedChunks.length}
+      - Success State: false
+      - Error: ${apiErr.message || String(apiErr)}
+      `);
+
+      const warnMsg = isRateLimitError 
+        ? "Selected model is currently rate-limited. Try another provider/model." 
+        : `Notice: AI-powered recovery was bypassed with errors (${apiErr.message || "Invalid API keys or network blocks"}). Reverting to default regex parsed result.`;
+
+      setWarning(warnMsg);
       return initialQuestions;
     } finally {
       setIsAiCleaning(false);
@@ -758,7 +806,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
               <div className="bg-emerald-555 h-full w-1/3 rounded-full animate-pulse" />
             </div>
             <p className="text-[10px] text-zinc-500 font-mono">
-              Running Gemini 3.5 Flash semantic recovery with stable Groq fallback
+              Selected Developer Target: {selectedModel}
             </p>
           </div>
         </div>
@@ -773,6 +821,48 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
           Client-side extraction. Your files never hit third-party servers. Review and fix parse structures instantly.
         </p>
       </div>
+
+      {/* TEMPORARY DEV MODEL SELECTION DROPDOWN */}
+      {questions.length === 0 && (
+        <div className="bg-zinc-950/60 border border-zinc-900 rounded-lg p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 animate-fade-in" id="dev-model-select-panel">
+          <div className="flex-1">
+            <div className="flex items-center gap-2 mb-1">
+              <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+              <label htmlFor="model-select" className="text-xs font-semibold text-zinc-300 uppercase tracking-wider font-mono">
+                Semantic Cleanup Model
+              </label>
+              <span className="text-[10px] bg-amber-950/50 text-amber-400 border border-amber-900/30 px-1.5 py-0.5 rounded font-mono font-medium">
+                Testing Module
+              </span>
+            </div>
+            <p className="text-[11px] text-zinc-500 leading-relaxed">
+              Select which LLM provider or offline fallback algorithm will perform semantic reconstruction on low-confidence PDF parsing streams.
+            </p>
+          </div>
+          <div className="w-full sm:w-auto shrink-0">
+            <select
+              id="model-select"
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              className="w-full sm:w-64 bg-zinc-900/80 border border-zinc-800 text-xs text-zinc-200 rounded px-2.5 py-2 font-mono transition-colors focus:outline-none focus:border-zinc-700 hover:border-zinc-700 cursor-pointer"
+            >
+              <optgroup label="Gemini REST API Models">
+                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (Smart Default)</option>
+                <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                <option value="gemini-2.0-flash">gemini-2.0-flash</option>
+              </optgroup>
+              <optgroup label="Groq OpenAI-Compatible Models">
+                <option value="qwen/qwen3-32b">Groq Qwen3 (qwen/qwen3-32b)</option>
+                <option value="llama-3.3-70b-versatile">Groq Llama (llama-3.3-70b-versatile)</option>
+              </optgroup>
+              <optgroup label="Offline Regex Core Engine">
+                <option value="regex-only-mode">regex-only-mode (Bypass AI entirely)</option>
+              </optgroup>
+            </select>
+          </div>
+        </div>
+      )}
 
       {error && (
         <div className="bg-red-950/20 border border-red-900 text-red-400 p-3.5 rounded-md text-xs flex gap-3 items-start animate-fade-in">
