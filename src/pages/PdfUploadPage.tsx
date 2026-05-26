@@ -37,6 +37,11 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   const [questions, setQuestions] = useState<Question[]>([]);
   const [isSaving, setIsSaving] = useState(false);
 
+  // Fallback states for raw / partial extraction
+  const [rawText, setRawText] = useState("");
+  const [showRawText, setShowRawText] = useState(false);
+  const [warning, setWarning] = useState<string | null>(null);
+
   // Handle local PDF upload
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -73,23 +78,56 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   const processPdf = async (pdfFile: File) => {
     setExtracting(true);
     setError(null);
+    setWarning(null);
     setProgress({ current: 0, total: 0 });
     try {
       const text = await extractTextFromPdf(pdfFile, (current, total) => {
         setProgress({ current, total });
       });
+      
+      setRawText(text);
       const parsed = parseQuestionsFromText(text);
+      
       if (parsed.length === 0) {
-        setError("We couldn't detect any structured multi-choice questions in this PDF. Custom questions can be added manually below.");
+        setWarning("Notice: We couldn't detect any structured multi-choice questions in this PDF, but the raw text was extracted successfully! You can review or edit the Extracted Raw Text below and hit 'Re-run Parser', or continue manually.");
         setQuestions([createNewQuestion(1)]);
       } else {
         setQuestions(parsed);
+        const incompleteCount = parsed.filter(q => q.options.some(opt => !opt.trim()) || q.correctOptionIndex === -1).length;
+        if (incompleteCount > 0) {
+          setWarning(`Extracted ${parsed.length} questions, but ${incompleteCount} of them appear to have blank options or are missing correct answers. You can fix them below, or review the raw extracted text.`);
+        }
       }
     } catch (e: any) {
       console.error(e);
-      setError("Failed to parse and extract text. Ensure the PDF contains readable text characters (not scanned images).");
+      setError("Failed to extract readable text characters from this PDF. Enabled fallback manual question entry mode.");
+      setRawText("");
+      setQuestions([createNewQuestion(1)]);
     } finally {
       setExtracting(false);
+    }
+  };
+
+  const handleReparseRawText = () => {
+    if (!rawText.trim()) return;
+    setError(null);
+    setWarning(null);
+    try {
+      const parsed = parseQuestionsFromText(rawText);
+      if (parsed.length === 0) {
+        setWarning("Re-parsed text, but no structured questions could be detected. Please ensure questions are structured with numbered headings (e.g., '1.', '2.') and options are clearly delimited.");
+      } else {
+        setQuestions(parsed);
+        const incompleteCount = parsed.filter(q => q.options.some(opt => !opt.trim()) || q.correctOptionIndex === -1).length;
+        if (incompleteCount > 0) {
+          setWarning(`Successfully re-parsed ${parsed.length} questions! Note: ${incompleteCount} of them are missing clean options or correct answers.`);
+        } else {
+          setWarning(`Successfully re-parsed ${parsed.length} questions! All options and correct answers loaded cleanly.`);
+        }
+      }
+    } catch (e: any) {
+      console.error(e);
+      setError("Re-parsing failed: " + e.message);
     }
   };
 
@@ -224,9 +262,57 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       </div>
 
       {error && (
-        <div className="bg-red-950/20 border border-red-900 text-red-400 p-3.5 rounded-md text-xs flex gap-3 items-start">
+        <div className="bg-red-950/20 border border-red-900 text-red-400 p-3.5 rounded-md text-xs flex gap-3 items-start animate-fade-in">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
           <p>{error}</p>
+        </div>
+      )}
+
+      {warning && (
+        <div className="bg-amber-950/20 border border-amber-900/60 text-amber-300 p-3.5 rounded-md text-xs flex gap-3 items-start animate-fade-in">
+          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
+          <div className="flex-1">
+            <p className="font-semibold mb-0.5 text-amber-200">Parser Notice</p>
+            <p>{warning}</p>
+          </div>
+        </div>
+      )}
+
+      {/* Raw Extracted Text Edit / Fallback Zone Accordion */}
+      {rawText.trim().length > 0 && (
+        <div className="border border-zinc-900 bg-zinc-950 p-4 rounded-lg flex flex-col gap-3">
+          <button
+            type="button"
+            onClick={() => setShowRawText(!showRawText)}
+            className="flex items-center justify-between w-full text-xs font-semibold tracking-wider text-zinc-400 uppercase font-mono text-left focus:outline-none"
+          >
+            <span>Raw Extracted Text Buffer ({showRawText ? "Hide Pane" : "Show / Edit Text"})</span>
+            <span className="text-[10px] text-zinc-550 bg-zinc-900 px-2 py-0.5 rounded border border-zinc-800 font-mono">
+              {rawText.length} chars
+            </span>
+          </button>
+
+          {showRawText && (
+            <div className="flex flex-col gap-3 mt-1 animate-fade-in">
+              <p className="text-[11px] text-zinc-500">
+                You can directly edit this raw text buffer to fix line breaks, spacing, option names, or formatting errors. Then click "Re-run Parser on Raw Text" to re-generate the structural list.
+              </p>
+              <textarea
+                rows={8}
+                value={rawText}
+                onChange={(e) => setRawText(e.target.value)}
+                className="w-full bg-zinc-900 border border-zinc-800 rounded p-3 text-xs text-zinc-300 font-mono focus:outline-none focus:border-zinc-700"
+                placeholder="Raw PDF text character stream..."
+              />
+              <button
+                type="button"
+                onClick={handleReparseRawText}
+                className="self-end px-3 py-1.5 bg-white text-black text-[11px] font-mono font-semibold rounded hover:bg-zinc-200 transition-colors"
+              >
+                Re-run Parser on Raw Text
+              </button>
+            </div>
+          )}
         </div>
       )}
 
