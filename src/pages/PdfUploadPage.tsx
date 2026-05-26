@@ -1,6 +1,6 @@
 import React, { useState, useRef } from "react";
 import { useAuth } from "../firebase/context";
-import { extractTextFromPdf, parseQuestionsFromText } from "../parsing/pdfParser";
+import { extractTextFromPdf, parseQuestionsFromText, assessChunkConfidence } from "../parsing/pdfParser";
 import { Question, QuestionSet } from "../types";
 import { collection, doc, writeBatch, Timestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase/config";
@@ -13,7 +13,8 @@ import {
   AlertCircle, 
   Save, 
   Grid,
-  Info
+  Info,
+  Sparkles
 } from "lucide-react";
 
 interface PdfUploadPageProps {
@@ -42,6 +43,11 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   const [rawText, setRawText] = useState("");
   const [showRawText, setShowRawText] = useState(false);
   const [warning, setWarning] = useState<string | null>(null);
+
+  // AI cleanup metrics states
+  const [parserConfidence, setParserConfidence] = useState<number | null>(null);
+  const [aiCleanedCount, setAiCleanedCount] = useState<number>(0);
+  const [isAiCleaning, setIsAiCleaning] = useState<boolean>(false);
 
   // Handle local PDF upload
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -75,9 +81,116 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     }
   };
 
+  // Apply AI Cleanup Fallback for low-confidence blocks
+  const runAiCleanupPipeline = async (initialQuestions: Question[]) => {
+    if (initialQuestions.length === 0) {
+      setParserConfidence(0);
+      setQuestions([]);
+      return;
+    }
+
+    // Identify low confidence and high confidence items
+    const highConfQuestions: Question[] = [];
+    const malformedChunks: string[] = [];
+
+    initialQuestions.forEach((q) => {
+      const rawChunk = q.rawChunkText || q.questionText + "\n" + q.options.join("\n");
+      const confidence = assessChunkConfidence(rawChunk, q);
+      if (confidence.isLowConfidence) {
+        malformedChunks.push(rawChunk);
+      } else {
+        highConfQuestions.push(q);
+      }
+    });
+
+    const malformedCount = malformedChunks.length;
+    const initialTotal = initialQuestions.length;
+    const initialConfidence = Math.round(((initialTotal - malformedCount) / initialTotal) * 100);
+    setParserConfidence(initialConfidence);
+
+    if (malformedChunks.length === 0) {
+      setQuestions(initialQuestions);
+      setAiCleanedCount(0);
+      return;
+    }
+
+    setIsAiCleaning(true);
+    setExtractionStage(`Applying AI recovery to ${malformedChunks.length} malformed question blocks...`);
+
+    try {
+      const response = await fetch("/api/gemini/clean-questions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ chunks: malformedChunks })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Server API response was not OK: ${response.statusText}`);
+      }
+
+      const data = await response.json();
+      const aiQuestions: Question[] = (data.questions || []).map((q: any, index: number) => {
+        const options = Array.isArray(q.options) ? q.options : ["", "", "", ""];
+        while (options.length < 4) {
+          options.push("");
+        }
+
+        const isBlank = !q.question_text || q.question_text.trim() === "";
+        const insufficientOpts = options.filter((o: any) => o && o.trim()).length < 2;
+        const correctIndex = typeof q.correct_option_index === "number" ? q.correct_option_index : -1;
+
+        let hasWarning = isBlank || insufficientOpts || correctIndex === -1;
+        let warningReason = "";
+
+        if (isBlank) {
+          warningReason = "Question description is completely blank.";
+        } else if (insufficientOpts) {
+          warningReason = "Missing multiple-choice options (Requires at least 2).";
+        } else if (correctIndex === -1) {
+          warningReason = "No correct answer index detected. Specify answer key manually on the card.";
+        }
+
+        return {
+          id: `q-ai-${Date.now()}-${index}-${Math.random().toString(36).substr(2, 5)}`,
+          questionText: q.question_text || `[Empty AI Reconstructed Question ${index + 1}]`,
+          options: options.map((opt: any) => String(opt || "").trim()),
+          correctOptionIndex: correctIndex,
+          explanation: q.explanation || "",
+          hasWarning,
+          warningReason,
+          isAiCleaned: true
+        } as Question;
+      });
+
+      const finalQuestionsList = [...highConfQuestions, ...aiQuestions];
+      setQuestions(finalQuestionsList);
+      setAiCleanedCount(aiQuestions.length);
+
+      // Re-calculate post confidence
+      const postWarnings = finalQuestionsList.filter(q => q.hasWarning).length;
+      const postConfidence = Math.round(((finalQuestionsList.length - postWarnings) / finalQuestionsList.length) * 100);
+      setParserConfidence(postConfidence);
+
+      if (aiQuestions.length > 0) {
+        setWarning(`AI cleanup recovery applied to malformed question blocks. Reconstructed ${aiQuestions.length} questions semantically from mangled PDF layout.`);
+      }
+    } catch (apiErr: any) {
+      console.warn("[Client Fallback] Gemini clean-questions endpoint failed:", apiErr);
+      setQuestions(initialQuestions);
+      setAiCleanedCount(0);
+      setWarning(`Notice: AI-powered recovery was bypassed due to service issue: ${apiErr.message || "Endpoint offline"}. Reverting to default regex parsed result.`);
+    } finally {
+      setIsAiCleaning(false);
+    }
+  };
+
   // Convert PDF to questions
   const processPdf = async (pdfFile: File) => {
     setExtracting(true);
+    setParserConfidence(null);
+    setAiCleanedCount(0);
     setError(null);
     setWarning(null);
     setProgress({ current: 0, total: 0 });
@@ -97,11 +210,7 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
         setWarning("Notice: We couldn't detect any structured multi-choice questions in this PDF, but the raw text was extracted successfully! You can review or edit the Extracted Raw Text below and hit 'Re-run Parser', or continue manually.");
         setQuestions([createNewQuestion(1)]);
       } else {
-        setQuestions(parsed);
-        const incompleteCount = parsed.filter(q => q.options.some(opt => !opt.trim()) || q.correctOptionIndex === -1).length;
-        if (incompleteCount > 0) {
-          setWarning(`Extracted ${parsed.length} questions, but ${incompleteCount} of them appear to have blank options or are missing correct answers. You can fix them below, or review the raw extracted text.`);
-        }
+        await runAiCleanupPipeline(parsed);
       }
     } catch (e: any) {
       console.error(e);
@@ -114,26 +223,25 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     }
   };
 
-  const handleReparseRawText = () => {
+  const handleReparseRawText = async () => {
     if (!rawText.trim()) return;
     setError(null);
     setWarning(null);
+    setParserConfidence(null);
+    setAiCleanedCount(0);
+    setIsAiCleaning(true);
     try {
       const parsed = parseQuestionsFromText(rawText);
       if (parsed.length === 0) {
         setWarning("Re-parsed text, but no structured questions could be detected. Please ensure questions are structured with numbered headings (e.g., '1.', '2.') and options are clearly delimited.");
+        setIsAiCleaning(false);
       } else {
-        setQuestions(parsed);
-        const incompleteCount = parsed.filter(q => q.options.some(opt => !opt.trim()) || q.correctOptionIndex === -1).length;
-        if (incompleteCount > 0) {
-          setWarning(`Successfully re-parsed ${parsed.length} questions! Note: ${incompleteCount} of them are missing clean options or correct answers.`);
-        } else {
-          setWarning(`Successfully re-parsed ${parsed.length} questions! All options and correct answers loaded cleanly.`);
-        }
+        await runAiCleanupPipeline(parsed);
       }
     } catch (e: any) {
       console.error(e);
       setError("Re-parsing failed: " + e.message);
+      setIsAiCleaning(false);
     }
   };
 
@@ -299,7 +407,32 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   };
 
   return (
-    <div className="w-full h-full text-zinc-100 flex flex-col gap-6 max-w-5xl mx-auto pb-12 font-sans">
+    <div className="w-full h-full text-zinc-100 flex flex-col gap-6 max-w-5xl mx-auto pb-12 font-sans relative">
+      {isAiCleaning && (
+        <div className="fixed inset-0 z-[100] bg-black/80 backdrop-blur-sm flex flex-col items-center justify-center gap-4 text-center animate-fade-in">
+          <div className="p-6 bg-zinc-950 border border-zinc-900 rounded-xl max-w-md flex flex-col items-center gap-4 shadow-2xl">
+            <div className="relative flex items-center justify-center">
+              <div className="w-12 h-12 border-2 border-emerald-500 border-t-transparent rounded-full animate-spin" />
+              <Sparkles className="w-5 h-5 text-emerald-400 absolute animate-pulse" />
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-white tracking-tight">
+                AI Cleanup Fallback Recovery Active
+              </p>
+              <p className="text-xs text-zinc-400 mt-1">
+                {extractionStage || "Reconstructing low-confidence text blocks..."}
+              </p>
+            </div>
+            <div className="w-full bg-zinc-900 h-1.5 rounded-full overflow-hidden border border-zinc-800">
+              <div className="bg-emerald-555 h-full w-1/3 rounded-full animate-pulse" />
+            </div>
+            <p className="text-[10px] text-zinc-500 font-mono">
+              Running gemini-3.5-flash semantic recovery
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* Header */}
       <div>
         <h2 className="text-xl font-semibold tracking-tight text-white mb-1">
@@ -447,6 +580,63 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       {/* Worksheet Review Section */}
       {questions.length > 0 && (
         <div className="flex flex-col gap-6 animate-fade-in">
+          {/* AI Metrics & Insights Panel */}
+          {parserConfidence !== null && (
+            <div className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg flex flex-col gap-4">
+              <h3 className="text-xs font-semibold tracking-wider text-zinc-400 flex items-center justify-between uppercase">
+                <div className="flex items-center gap-1.5">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                  </span>
+                  <span>AI Extraction Recovery Diagnostics</span>
+                </div>
+                {aiCleanedCount > 0 && (
+                  <span className="bg-emerald-950/45 text-emerald-300 text-[10px] font-mono px-2 py-0.5 rounded border border-emerald-900/60 flex items-center gap-1">
+                    <Sparkles className="w-3 h-3 text-emerald-400 shrink-0" />
+                    <span>AI cleanup recovery applied to malformed question blocks.</span>
+                  </span>
+                )}
+              </h3>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="bg-zinc-900/40 p-4 rounded border border-zinc-900 flex flex-col justify-center">
+                  <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider mb-1">Parser Confidence Score</p>
+                  <p className="text-2xl font-bold tracking-tight font-mono">
+                    <span className={parserConfidence >= 80 ? "text-emerald-400" : parserConfidence >= 50 ? "text-amber-400" : "text-rose-400"}>
+                      {parserConfidence}%
+                    </span>
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    {parserConfidence >= 80 
+                      ? "High-fidelity extraction. Structural grammar and option bounds resolved." 
+                      : "Sparsely formatted layout. Manual validation of highlighted warning cards recommended."}
+                  </p>
+                </div>
+
+                <div className="bg-zinc-900/40 p-4 rounded border border-zinc-900 flex flex-col justify-center">
+                  <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider mb-1">Low Confidence Detections</p>
+                  <p className="text-2xl font-bold tracking-tight font-mono text-zinc-355">
+                    {questions.filter(q => q.hasWarning).length} Chunks
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    Total blocks flagged with missing options, blank descriptions, or unmapped keys.
+                  </p>
+                </div>
+
+                <div className="bg-zinc-900/40 p-4 rounded border border-zinc-900 flex flex-col justify-center">
+                  <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider mb-1">AI Reconstructed Questions</p>
+                  <p className="text-2xl font-bold tracking-tight font-mono text-emerald-400">
+                    {aiCleanedCount} Cleaned
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    Mashed or low-confidence layouts semantically restored with Gemini Flash.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* Metadata Grid */}
           <div className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg flex flex-col gap-4">
             <h3 className="text-xs font-semibold tracking-wider text-zinc-400 flex items-center gap-1.5 uppercase">

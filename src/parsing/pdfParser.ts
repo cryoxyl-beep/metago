@@ -479,7 +479,8 @@ export function parseQuestionsFromText(text: string): Question[] {
       correctOptionIndex,
       explanation,
       hasWarning,
-      warningReason
+      warningReason,
+      rawChunkText: chunkText
     });
 
     // STEP 7: Debugging logs for segmentation monitoring
@@ -488,4 +489,77 @@ export function parseQuestionsFromText(text: string): Question[] {
 
   console.log(`[PDF Parser Segmentation Done] Total: ${questions.length} questions parsed. Flagged Warning Cards: ${failedIndexes.length} (Indexes: [${failedIndexes.join(", ")}]).`);
   return questions;
+}
+
+export interface ChunkConfidence {
+  isLowConfidence: boolean;
+  reasons: string[];
+}
+
+/**
+ * Evaluates the confidence level of a single parsed question chunk.
+ * Flags typical PDF extraction issues such as merged structures, too-large text bodies,
+ * missing option tokens, duplicate option keys, or scrambled letter sequences.
+ */
+export function assessChunkConfidence(chunkText: string, parsed: Question): ChunkConfidence {
+  const reasons: string[] = [];
+
+  // 1. Fewer than 2 detected options
+  const populatedOptions = parsed.options.filter(o => o.trim().length > 0).length;
+  if (populatedOptions < 2) {
+    reasons.push("Fewer than 2 multiple-choice options detected.");
+  }
+
+  // 2. Question text too large
+  if (parsed.questionText.trim().length > 1000) {
+    reasons.push("Question text body is unusually large (exceeds 1000 characters).");
+  }
+
+  // 3. Multiple question numbers detected inside one chunk (merged questions)
+  let remainingText = chunkText.trim();
+  const startingHeaderRegex = /^(?:(?:[Qq]uestion|[Qq])\s*(\d{1,3})(?:\s*[\.\)\-\:\s]+)?|(\d{1,3})\s*[\.\)\-\:]+)/i;
+  remainingText = remainingText.replace(startingHeaderRegex, "");
+
+  const questionHeaderRegexSub = /(?:(?:[Qq]uestion|[Qq])\s*(\d{1,3})|(?:\s+|^)(\d{1,3})\s*[\.\)\-\:]+)/g;
+  const subMatches: string[] = [];
+  let m;
+  while ((m = questionHeaderRegexSub.exec(remainingText)) !== null) {
+    subMatches.push(m[0]);
+  }
+  if (subMatches.length > 0) {
+    reasons.push(`Possible merged questions: detected mid-chunk question numbers (e.g. ${subMatches.join(", ")}).`);
+  }
+
+  // 4. Repeated option markers or malformed option order
+  const optionPrefixRegex = /(?:\s+|^)[\(\[=]?([A-Da-d])[\)\]\.\-\s=]+/g;
+  const matches: string[] = [];
+  let optMatch;
+  while ((optMatch = optionPrefixRegex.exec(chunkText)) !== null) {
+    matches.push(optMatch[1].toUpperCase());
+  }
+  const hasRepeatedMarkers = matches.some((val, i) => matches.indexOf(val) !== i);
+  if (hasRepeatedMarkers) {
+    reasons.push("Repeated option characters detected.");
+  }
+
+  let isSorted = true;
+  for (let i = 0; i < matches.length - 1; i++) {
+    if (matches[i].charCodeAt(0) > matches[i + 1].charCodeAt(0)) {
+      isSorted = false;
+      break;
+    }
+  }
+  if (!isSorted) {
+    reasons.push("Irregular or shuffled option letters order.");
+  }
+
+  // 5. Chunk exceeds expected size (too big)
+  if (chunkText.length > 1500) {
+    reasons.push("Raw question chunk exceeds safe size threshold (1500 characters).");
+  }
+
+  return {
+    isLowConfidence: reasons.length > 0,
+    reasons
+  };
 }

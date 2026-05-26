@@ -9,6 +9,8 @@ export interface Question {
   year?: string;
   hasWarning?: boolean;
   warningReason?: string;
+  isAiCleaned?: boolean;
+  rawChunkText?: string;
 }
 
 export interface QuestionSet {
