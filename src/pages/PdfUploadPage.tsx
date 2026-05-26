@@ -41,6 +41,7 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
 
   // Fallback states for raw / partial extraction
   const [rawText, setRawText] = useState("");
+  const [extractedImages, setExtractedImages] = useState<any[]>([]);
   const [showRawText, setShowRawText] = useState(false);
   const [warning, setWarning] = useState<string | null>(null);
 
@@ -106,13 +107,23 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
 
     // Identify low confidence and high confidence items
     const highConfQuestions: Question[] = [];
-    const malformedChunks: string[] = [];
+    
+    interface MalformedChunk {
+      rawChunkText: string;
+      questionImage?: string;
+      originalQuestion: Question;
+    }
+    const malformedChunks: MalformedChunk[] = [];
 
     initialQuestions.forEach((q) => {
       const rawChunk = q.rawChunkText || q.questionText + "\n" + q.options.join("\n");
       const confidence = assessChunkConfidence(rawChunk, q);
       if (confidence.isLowConfidence) {
-        malformedChunks.push(rawChunk);
+        malformedChunks.push({
+          rawChunkText: rawChunk,
+          questionImage: q.questionImage,
+          originalQuestion: q
+        });
       } else {
         highConfQuestions.push(q);
       }
@@ -211,7 +222,7 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
 
       // STEP 4: Limit malformed reconstruction batches to: MAXIMUM 2 QUESTIONS PER CHUNK
       const batchSize = 2;
-      const batches: string[][] = [];
+      const batches: MalformedChunk[][] = [];
       for (let i = 0; i < malformedChunks.length; i += batchSize) {
         batches.push(malformedChunks.slice(i, i + batchSize));
       }
@@ -222,9 +233,9 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       const systemMessage = `You are an expert curriculum assistant. Clean and reconstruct malformed question blocks into JSON. Restore equations and layout. Preserve content without inventing answers. Output JSON with a "questions" key matching this schema:
 {"questions": [{"question_text": "text", "options": ["str", "str", "str", "str"], "correct_option_index": null, "explanation": ""}]}`;
 
-      const processBatchWithSelectedModel = async (batch: string[], batchIdx: number) => {
+      const processBatchWithSelectedModel = async (batch: MalformedChunk[], batchIdx: number) => {
         const userPrompt = `JSON-repair these malformed PDF question blocks:
-${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
+${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}`;
 
         const startTime = performance.now();
         let finalStatus: number | null = null;
@@ -236,10 +247,29 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
           const endpointUrl = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${geminiApiKey}`;
           lastEndpoint = endpointUrl;
 
+          // Prepare the parts list
+          const promptParts: any[] = [
+            { text: `${systemMessage}\n\nTask:\n${userPrompt}` }
+          ];
+
+          // Append each associated image in this batch to promptParts if it exists
+          batch.forEach((c) => {
+            if (c.questionImage) {
+              const base64Data = c.questionImage.split(",")[1] || c.questionImage;
+              promptParts.push({
+                inlineData: {
+                  mimeType: "image/png",
+                  data: base64Data
+                }
+              });
+              console.log(`[Multimodal Gemini] Appending image part to batch request (length: ${base64Data.length})`);
+            }
+          });
+
           // STEP 3: thinkingConfig: { thinkingBudget: 0 }
           const requestPayload = {
             systemInstruction: { parts: [{ text: systemMessage }] },
-            contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
+            contents: [{ parts: promptParts }],
             generationConfig: { 
               responseMimeType: "application/json",
               thinkingConfig: {
@@ -358,6 +388,15 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
           }
         }
 
+        // Map original image back to the corresponding resulting element
+        for (let idx = 0; idx < list.length; idx++) {
+          const originalChunk = batch[idx] || batch[batch.length - 1];
+          if (originalChunk && originalChunk.questionImage) {
+            list[idx].questionImage = originalChunk.questionImage;
+            console.log(`[Reconstruct Association] Restored original image to question index ${idx}`);
+          }
+        }
+
         if (batchIdx === batches.length - 1) {
           setGeminiDebug({
             modelName: selectedModel,
@@ -439,6 +478,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
           options: options.map((opt: any) => String(opt || "").trim()),
           correctOptionIndex: correctIndex,
           explanation: q.explanation || "",
+          questionImage: q.questionImage || undefined,
           hasWarning,
           warningReason,
           isAiCleaned: true
@@ -553,7 +593,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
       }
 
       setExtractionStage("Initializing multi-stage extraction...");
-      const text = await extractTextFromPdf(
+      const { fullText, images } = await extractTextFromPdf(
         pdfFile, 
         (current, total, stage) => {
           setProgress({ current, total });
@@ -566,8 +606,9 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
         }
       );
       
-      setRawText(text);
-      const parsed = parseQuestionsFromText(text);
+      setRawText(fullText);
+      setExtractedImages(images);
+      const parsed = parseQuestionsFromText(fullText, images);
       
       let finalQuestions: Question[] = [];
       if (parsed.length === 0) {
@@ -587,7 +628,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
           questions: finalQuestions,
           parserConfidence: postConfidence,
           ocrTelemetry: ocrTelemetry,
-          rawText: text,
+          rawText: fullText,
           aiCleanedCount: finalQuestions.filter(q => q.isAiCleaned).length
         }));
         console.log("[Cache Engine] PDF processed results saved successfully to client-side localStorage.");
@@ -613,7 +654,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
     setAiCleanedCount(0);
     setIsAiCleaning(true);
     try {
-      const parsed = parseQuestionsFromText(rawText);
+      const parsed = parseQuestionsFromText(rawText, extractedImages);
       if (parsed.length === 0) {
         setWarning("Re-parsed text, but no structured questions could be detected. Please ensure questions are structured with numbered headings (e.g., '1.', '2.') and options are clearly delimited.");
         setIsAiCleaning(false);
@@ -1433,6 +1474,30 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
                       />
                     </div>
                   </div>
+
+                  {/* Attached Question Visual Diagram (Scientific Preservation) */}
+                  {q.questionImage && (
+                    <div className="pl-9 pr-2 max-w-full">
+                      <div className="relative border border-zinc-800 bg-zinc-900/40 rounded p-3 flex flex-col gap-2 overflow-hidden group">
+                        <span className="text-[9px] text-zinc-500 font-mono uppercase tracking-wider font-semibold">Isolated Diagram / Mathematical Equation Preserved</span>
+                        <img 
+                          src={q.questionImage} 
+                          alt={`Visual diagram for question ${qIdx + 1}`}
+                          className="max-h-72 object-contain rounded border border-zinc-800 bg-slate-50 p-2"
+                          referrerPolicy="no-referrer"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setQuestions(questions.map(item => item.id === q.id ? { ...item, questionImage: undefined } : item));
+                          }}
+                          className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 bg-red-950/80 hover:bg-red-900 border border-red-800 text-red-200 text-[10px] uppercase font-mono px-2 py-1 rounded transition-opacity"
+                        >
+                          Clear Image
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   {/* Options panel */}
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pl-9">

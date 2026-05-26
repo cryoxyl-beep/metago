@@ -11,6 +11,7 @@ export interface Question {
   warningReason?: string;
   isAiCleaned?: boolean;
   rawChunkText?: string;
+  questionImage?: string;
 }
 
 export interface QuestionSet {
