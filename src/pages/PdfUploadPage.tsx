@@ -116,23 +116,22 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     }
 
     setIsAiCleaning(true);
-    setExtractionStage(`Applying AI recovery to ${malformedChunks.length} malformed question blocks...`);
+    setExtractionStage("Gemini 3.5 semantic cleanup running...");
 
     try {
-      const apiKey = (import.meta as any).env.VITE_GROQ_API_KEY;
-      if (!apiKey || apiKey.trim() === "" || apiKey === "YOUR_GROQ_API_KEY") {
-        console.warn("[Groq Client] VITE_GROQ_API_KEY is not configured or left as placeholder in environment variables.");
-        throw new Error("Missing VITE_GROQ_API_KEY. Please provide the key in the settings panel or .env file.");
+      const geminiApiKey = (import.meta as any).env.VITE_GEMINI_API_KEY;
+      const groqApiKey = (import.meta as any).env.VITE_GROQ_API_KEY;
+
+      const hasGemini = geminiApiKey && geminiApiKey.trim() !== "" && geminiApiKey !== "YOUR_GEMINI_API_KEY";
+      const hasGroq = groqApiKey && groqApiKey.trim() !== "" && groqApiKey !== "YOUR_GROQ_API_KEY";
+
+      if (!hasGemini && !hasGroq) {
+        console.warn("[AI Cleanup] No valid VITE_GEMINI_API_KEY or VITE_GROQ_API_KEY provided.");
+        throw new Error("Missing API Keys (Gemini/Groq). Please specify keys in the settings panel or .env file.");
       }
 
-      const activeModel = "qwen/qwen3-32b";
-      const fallbackModel = "llama-3.3-70b-versatile";
-
-      // 1. Log: Groq request started (malformed chunk count)
-      console.log(`[Groq Client] Request started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
-
-      // 2. Log: Active model string used
-      console.log(`[Groq Client] Active model string selected: ${activeModel}. Fallback model: ${fallbackModel}`);
+      // Log: Chain request started
+      console.log(`[AI Pipeline] Request started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
 
       // Batch 3 to 5 malformed chunks maximum per request
       const batchSize = 4;
@@ -141,7 +140,7 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
         batches.push(malformedChunks.slice(i, i + batchSize));
       }
 
-      console.log(`[Groq Client] Batching ${malformedChunks.length} chunks into ${batches.length} groups of size ${batchSize}.`);
+      console.log(`[AI Pipeline] Batching ${malformedChunks.length} chunks into ${batches.length} groups of size ${batchSize}.`);
 
       const batchPromises = batches.map(async (batch, batchIdx) => {
         const userPrompt = `Reconstruct the following mangled multiple choice question blocks from a PDF reading extraction.
@@ -153,8 +152,6 @@ Keep "explanation" as an empty string.
 --- START QUESTION BLOCKS TO RECONSTRUCT ---
 ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
 --- END QUESTION BLOCKS ---`;
-
-        console.log(`[Groq Client] Preparing fetch for batch ${batchIdx + 1} of ${batches.length}.`);
 
         const systemMessage = `You are an expert curriculum assistant specializing in PDF reading recovery. Your sole job is to clean, separate, and reconstruct malformed question blocks into JSON format. Do not make up answers, do not speculate explanations, and do not invent content. Always preserve exact math equations, symbols, and formatting where possible.
 You MUST reply with a JSON object containing a "questions" key containing an array of reconstructed question items in this exact schema format:
@@ -169,68 +166,193 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
   ]
 }`;
 
-        const makeRequest = async (modelName: string) => {
-          return await fetch("https://api.groq.com/openai/v1/chat/completions", {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${apiKey}`
-            },
-            body: JSON.stringify({
-              model: modelName,
-              messages: [
-                { role: "system", content: systemMessage },
-                { role: "user", content: userPrompt }
-              ],
-              temperature: 0.1,
-              response_format: { type: "json_object" }
-            })
-          });
-        };
+        console.log(`[AI Pipeline] Preparing logic for batch ${batchIdx + 1} of ${batches.length}.`);
 
-        const startTime = performance.now();
-        let response: Response;
-        let finalModelUsed = activeModel;
+        let success = false;
+        let responseText = "";
+        let finalModelUsed = "";
+        const errorsList: string[] = [];
 
-        try {
-          console.log(`[Groq Client] Dispatching request with active model: ${activeModel} (Batch ${batchIdx + 1}/${batches.length})`);
-          response = await makeRequest(activeModel);
-          if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`Groq API response not OK: ${response.status} ${errText}`);
-          }
-        } catch (error: any) {
-          // Log: model failure reason
-          console.warn(`[Groq Client] Active model (${activeModel}) failed for batch ${batchIdx + 1}.`);
-          console.warn(`[Groq Client] Model failure reason: ${error?.message || error}`);
-          
-          // Log: fallback model usage
-          console.log(`[Groq Client] Fallback model usage triggered. Switching to fallback model: ${fallbackModel} (Batch ${batchIdx + 1}/${batches.length})`);
-          
-          finalModelUsed = fallbackModel;
+        // 1. PRIMARY MODEL: gemini-3.5-flash
+        if (hasGemini && !success) {
+          const modelName = "gemini-3.5-flash";
           try {
-            response = await makeRequest(fallbackModel);
+            console.log(`[AI Pipeline] Dispatching request with active model: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
+            const startTime = performance.now();
+            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: systemMessage }] },
+                contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
+                generationConfig: { responseMimeType: "application/json" }
+              })
+            });
+
             if (!response.ok) {
               const errText = await response.text();
-              throw new Error(`Fallback Groq API response not OK: ${response.status} ${errText}`);
+              throw new Error(`HTTP status ${response.status}: ${errText}`);
             }
-          } catch (fallbackError: any) {
-            console.error(`[Groq Client] Fallback model (${fallbackModel}) also failed for batch ${batchIdx + 1}: ${fallbackError?.message || fallbackError}`);
-            throw fallbackError;
+
+            const data = await response.json();
+            const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!textResult) {
+              throw new Error("Empty candidate part contents returned from Gemini REST API");
+            }
+
+            responseText = textResult;
+            finalModelUsed = modelName;
+            success = true;
+            console.log(`[AI Pipeline] Gemini 3.5 recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
+          } catch (gemErr35: any) {
+            const rawMsg = gemErr35?.message || String(gemErr35);
+            console.warn(`[AI Pipeline] Active model (${modelName}) failed/rate-limited for batch ${batchIdx + 1}: ${rawMsg}`);
+            errorsList.push(`${modelName}: ${rawMsg}`);
           }
         }
 
-        const nativeLatency = performance.now() - startTime;
-        // Log: Native response latency (ms) and final model used
-        console.log(`[Groq Client] Native response latency for batch ${batchIdx + 1}: ${nativeLatency.toFixed(2)} ms. Model used: ${finalModelUsed}. HTTP Status: ${response.status}`);
+        // 2. BACKUP MODEL: gemini-2.5-flash
+        if (hasGemini && !success) {
+          const modelName = "gemini-2.5-flash";
+          try {
+            console.log(`[AI Pipeline] Fallback model usage triggered: switching to backup Gemini: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
+            setExtractionStage("Gemini 3.5 failed, attempting Gemini 2.5...");
+            const startTime = performance.now();
+            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: systemMessage }] },
+                contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
+                generationConfig: { responseMimeType: "application/json" }
+              })
+            });
 
-        const responseData = await response.json();
-        const responseText = responseData?.choices?.[0]?.message?.content || "{}";
+            if (!response.ok) {
+              const errText = await response.text();
+              throw new Error(`HTTP status ${response.status}: ${errText}`);
+            }
+
+            const data = await response.json();
+            const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+            if (!textResult) {
+              throw new Error("Empty candidate part contents returned from Gemini REST API");
+            }
+
+            responseText = textResult;
+            finalModelUsed = modelName;
+            success = true;
+            console.log(`[AI Pipeline] Gemini 2.5 recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
+          } catch (gemErr25: any) {
+            const rawMsg = gemErr25?.message || String(gemErr25);
+            console.warn(`[AI Pipeline] Backup model (${modelName}) failed/rate-limited for batch ${batchIdx + 1}: ${rawMsg}`);
+            errorsList.push(`${modelName}: ${rawMsg}`);
+          }
+        }
+
+        // 3. GROQ KEY FALLBACK: qwen/qwen3-32b
+        if (hasGroq && !success) {
+          const modelName = "qwen/qwen3-32b";
+          try {
+            console.warn(`[AI Pipeline] Gemini rate limit reached or layers failed, switching to Groq fallback: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
+            setExtractionStage("Gemini rate limit reached, switching to Groq fallback...");
+            const startTime = performance.now();
+            const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${groqApiKey}`
+              },
+              body: JSON.stringify({
+                model: modelName,
+                messages: [
+                  { role: "system", content: systemMessage },
+                  { role: "user", content: userPrompt }
+                ],
+                temperature: 0.1,
+                response_format: { type: "json_object" }
+              })
+            });
+
+            if (!response.ok) {
+              const errText = await response.text();
+              throw new Error(`HTTP status ${response.status}: ${errText}`);
+            }
+
+            const responseData = await response.json();
+            const textResult = responseData?.choices?.[0]?.message?.content;
+            if (!textResult) {
+              throw new Error("Empty chat content returned from Groq chat completion API");
+            }
+
+            responseText = textResult;
+            finalModelUsed = modelName;
+            success = true;
+            setExtractionStage("Groq semantic recovery active...");
+            console.log(`[AI Pipeline] Groq Qwen recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
+          } catch (groqErr: any) {
+            const rawMsg = groqErr?.message || String(groqErr);
+            console.warn(`[AI Pipeline] Groq fallback (${modelName}) failed for batch ${batchIdx + 1}: ${rawMsg}`);
+            errorsList.push(`${modelName}: ${rawMsg}`);
+          }
+        }
+
+        // 4. GROQ SECOND FALLBACK: llama-3.3-70b-versatile
+        if (hasGroq && !success) {
+          const modelName = "llama-3.3-70b-versatile";
+          try {
+            console.warn(`[AI Pipeline] Groq Qwen failed, switching to Groq backup Llama: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
+            setExtractionStage("Groq semantic recovery active...");
+            const startTime = performance.now();
+            const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${groqApiKey}`
+              },
+              body: JSON.stringify({
+                model: modelName,
+                messages: [
+                  { role: "system", content: systemMessage },
+                  { role: "user", content: userPrompt }
+                ],
+                temperature: 0.1,
+                response_format: { type: "json_object" }
+              })
+            });
+
+            if (!response.ok) {
+              const errText = await response.text();
+              throw new Error(`HTTP status ${response.status}: ${errText}`);
+            }
+
+            const responseData = await response.json();
+            const textResult = responseData?.choices?.[0]?.message?.content;
+            if (!textResult) {
+              throw new Error("Empty chat content returned from Groq chat completion API");
+            }
+
+            responseText = textResult;
+            finalModelUsed = modelName;
+            success = true;
+            console.log(`[AI Pipeline] Groq Llama backup recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
+          } catch (llamaErr: any) {
+            const rawMsg = llamaErr?.message || String(llamaErr);
+            console.error(`[AI Pipeline] Groq Llama fallback (${modelName}) failed for batch ${batchIdx + 1}: ${rawMsg}`);
+            errorsList.push(`${modelName}: ${rawMsg}`);
+          }
+        }
+
+        if (!success) {
+          throw new Error(`All semantic reconstitution models failed to process batch ${batchIdx + 1}:\n${errorsList.join("\n")}`);
+        }
+
+        // Log active provider, chunk index, latency, and success status
+        console.log(`[AI Pipeline] Batch ${batchIdx + 1} finalized successfully. Active provider utilized: ${finalModelUsed}`);
 
         try {
           const parsedGroup = JSON.parse(responseText.trim());
-          // Log: JSON parsing success
-          console.log(`[Groq Client] JSON parsing success status for batch ${batchIdx + 1}.`);
+          console.log(`[AI Pipeline] JSON parsing success status for batch ${batchIdx + 1}.`);
 
           let list: any[] = [];
           if (Array.isArray(parsedGroup)) {
@@ -245,8 +367,7 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
           }
           return list;
         } catch (jsonErr) {
-          // Log: JSON parsing failure
-          console.error(`[Groq Client] JSON parsing failure status for batch ${batchIdx + 1}:`, responseText, jsonErr);
+          console.error(`[AI Pipeline] JSON parsing failure status for batch ${batchIdx + 1}:`, responseText, jsonErr);
           throw jsonErr;
         }
       });
@@ -300,10 +421,10 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
         setWarning(`AI cleanup recovery applied to malformed question blocks. Reconstructed ${aiQuestions.length} questions semantically from mangled PDF layout.`);
       }
     } catch (apiErr: any) {
-      console.warn("[Groq Fallback] direct model request failed:", apiErr);
+      console.warn("[AI Fallback Engine] Semantic cleanup model request chain failed completely:", apiErr);
       setQuestions(initialQuestions);
       setAiCleanedCount(0);
-      setWarning(`Notice: AI-powered recovery was bypassed (${apiErr.message || "Invalid API key or network block"}). Reverting to default regex parsed result.`);
+      setWarning(`Notice: AI-powered recovery was bypassed (${apiErr.message || "Invalid API keys or network blocks"}). Reverting to default regex parsed result.`);
     } finally {
       setIsAiCleaning(false);
     }
@@ -557,7 +678,7 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
               <div className="bg-emerald-555 h-full w-1/3 rounded-full animate-pulse" />
             </div>
             <p className="text-[10px] text-zinc-500 font-mono">
-              Running Qwen 3 32B / Llama 3.3 70B semantic recovery on Groq
+              Running Gemini 3.5 Flash semantic recovery with stable Groq fallback
             </p>
           </div>
         </div>
