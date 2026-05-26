@@ -1,6 +1,7 @@
 import React, { useState, useRef } from "react";
 import { useAuth } from "../firebase/context";
 import { extractTextFromPdf, parseQuestionsFromText, assessChunkConfidence } from "../parsing/pdfParser";
+import { uploadImageToCloudinary, shouldUploadImage } from "../parsing/cloudinary";
 import { Question, QuestionSet, OcrTelemetry } from "../types";
 import { collection, doc, writeBatch, Timestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase/config";
@@ -66,6 +67,63 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   const [showDebugPanel, setShowDebugPanel] = useState<boolean>(false);
   const [selectedModel, setSelectedModel] = useState<string>("gemini-3.1-flash-lite");
 
+  // Ref to track question IDs that are currently being uploaded or processed to prevent double-upload triggers
+  const uploadingRef = useRef<Record<string, boolean>>({});
+
+  React.useEffect(() => {
+    // Find first question that has local image, is pending, and is not already in-flight
+    const candidate = questions.find(q => 
+      q.question_image_local && 
+      q.image_upload_status === "pending" && 
+      !q.question_image_url &&
+      !uploadingRef.current[q.id]
+    );
+
+    if (!candidate || !candidate.question_image_local) return;
+
+    const qId = candidate.id;
+    const base64Data = candidate.question_image_local;
+
+    // Mark as in-flight
+    uploadingRef.current[qId] = true;
+
+    const processUpload = async () => {
+      console.log(`[Cloudinary Queue] Checking visual dimensions for Question ID: ${qId}...`);
+      try {
+        const meetsThreshold = await shouldUploadImage(base64Data);
+        if (!meetsThreshold) {
+          console.warn(`[Cloudinary Queue] Image for Question ID ${qId} filtered out. Dimension under 64x64 threshold (decorative icon/logo). Skipping upload.`);
+          setQuestions(prev => prev.map(q => q.id === qId ? {
+            ...q,
+            image_upload_status: "failed" as const,
+            warningReason: q.warningReason ? `${q.warningReason} (Decorative visual skipped from cloud storage.)` : "Decorative visual skipped from cloud storage."
+          } : q));
+          return;
+        }
+
+        console.log(`[Cloudinary Queue] Uploading valid scientific visual to Cloudinary for Question ID: ${qId}...`);
+        const secureUrl = await uploadImageToCloudinary(base64Data);
+        console.log(`[Cloudinary Queue] Successfully uploaded! Secure URL: ${secureUrl}`);
+
+        setQuestions(prev => prev.map(q => q.id === qId ? {
+          ...q,
+          question_image_url: secureUrl,
+          image_upload_status: "uploaded" as const
+        } : q));
+      } catch (err: any) {
+        console.error(`[Cloudinary Queue] Upload failed for Question ID ${qId}:`, err);
+        setQuestions(prev => prev.map(q => q.id === qId ? {
+          ...q,
+          image_upload_status: "failed" as const
+        } : q));
+      } finally {
+        delete uploadingRef.current[qId];
+      }
+    };
+
+    processUpload();
+  }, [questions]);
+
   // Handle local PDF upload
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -105,6 +163,18 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       return [];
     }
 
+    // Map initial local details if they exist to kick off background upload
+    const mappedQuestions = initialQuestions.map(q => {
+      if (q.questionImage && !q.question_image_local) {
+        return {
+          ...q,
+          question_image_local: q.questionImage,
+          image_upload_status: "pending" as const
+        };
+      }
+      return q;
+    });
+
     // Identify low confidence and high confidence items
     const highConfQuestions: Question[] = [];
     
@@ -115,13 +185,13 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     }
     const malformedChunks: MalformedChunk[] = [];
 
-    initialQuestions.forEach((q) => {
+    mappedQuestions.forEach((q) => {
       const rawChunk = q.rawChunkText || q.questionText + "\n" + q.options.join("\n");
       const confidence = assessChunkConfidence(rawChunk, q);
       if (confidence.isLowConfidence) {
         malformedChunks.push({
           rawChunkText: rawChunk,
-          questionImage: q.questionImage,
+          questionImage: q.question_image_local || q.questionImage,
           originalQuestion: q
         });
       } else {
@@ -130,14 +200,14 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
     });
 
     const malformedCount = malformedChunks.length;
-    const initialTotal = initialQuestions.length;
+    const initialTotal = mappedQuestions.length;
     const initialConfidence = Math.round(((initialTotal - malformedCount) / initialTotal) * 100);
     setParserConfidence(initialConfidence);
 
     if (malformedChunks.length === 0) {
-      setQuestions(initialQuestions);
+      setQuestions(mappedQuestions);
       setAiCleanedCount(0);
-      return initialQuestions;
+      return mappedQuestions;
     }
 
     setGeminiDebug(null); // Clear previous debug info
@@ -254,7 +324,13 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
 
           // Append each associated image in this batch to promptParts if it exists
           batch.forEach((c) => {
-            if (c.questionImage) {
+            const cloudinaryUrl = c.originalQuestion?.question_image_url;
+            if (cloudinaryUrl) {
+              promptParts.push({
+                text: `[Image URL associated with this question block: ${cloudinaryUrl}]`
+              });
+              console.log(`[Multimodal Gemini] Using permanent Cloudinary URL for Gemini prompt: ${cloudinaryUrl}`);
+            } else if (c.questionImage) {
               const base64Data = c.questionImage.split(",")[1] || c.questionImage;
               promptParts.push({
                 inlineData: {
@@ -391,8 +467,17 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
         // Map original image back to the corresponding resulting element
         for (let idx = 0; idx < list.length; idx++) {
           const originalChunk = batch[idx] || batch[batch.length - 1];
-          if (originalChunk && originalChunk.questionImage) {
+          if (originalChunk && originalChunk.originalQuestion) {
+            const orig = originalChunk.originalQuestion;
+            list[idx].questionImage = orig.questionImage;
+            list[idx].question_image_local = orig.question_image_local;
+            list[idx].question_image_url = orig.question_image_url;
+            list[idx].image_upload_status = orig.image_upload_status;
+            console.log(`[Reconstruct Association] Restored original image properties to question index ${idx}`);
+          } else if (originalChunk && originalChunk.questionImage) {
             list[idx].questionImage = originalChunk.questionImage;
+            list[idx].question_image_local = originalChunk.questionImage;
+            list[idx].image_upload_status = "pending";
             console.log(`[Reconstruct Association] Restored original image to question index ${idx}`);
           }
         }
@@ -479,6 +564,9 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
           correctOptionIndex: correctIndex,
           explanation: q.explanation || "",
           questionImage: q.questionImage || undefined,
+          question_image_local: q.question_image_local || q.questionImage || undefined,
+          question_image_url: q.question_image_url || undefined,
+          image_upload_status: q.image_upload_status || (q.question_image_local || q.questionImage ? "pending" : undefined),
           hasWarning,
           warningReason,
           isAiCleaned: true
@@ -768,9 +856,47 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
     setIsSaving(true);
     setError(null);
 
-    const questionSetId = `set-${Math.random().toString(36).substr(2, 9)}`;
-    const firestorePath = `questionSets/${questionSetId}`;
+    // 1. PERFORM BACKGROUND WAIT FOR CLOUDINARY QUEUE TO EMPTY
+    let attempts = 0;
+    let hasPending = true;
+    while (attempts < 30) { // Max 15s wait
+      const pendingUploads = questions.some(q => 
+        q.question_image_local && 
+        !q.question_image_url && 
+        q.image_upload_status === "pending"
+      );
+      if (!pendingUploads) {
+        hasPending = false;
+        break;
+      }
+      console.log("[Background Queue] Cloudinary upload is in progress. Waiting 500ms...");
+      await new Promise(resolve => setTimeout(resolve, 500));
+      attempts++;
+    }
 
+    if (hasPending) {
+      console.warn("[Background Queue] Cloudinary queue wait timed out. Proceeding with whatever has completed.");
+    }
+
+    // 2. BUILD STRIPPED/PERMANENT QUESTIONS LIST
+    // Stripping giant base64 strings so they never reach Firestore!
+    const sanitizedQuestions = questions.map((q) => {
+      // Destructure and omit base64 fields to optimize storage footprint
+      const { questionImage, question_image_local, ...cleanQ } = q;
+      return {
+        ...cleanQ,
+        // Replace with permanent Cloudinary URL if available; else empty string
+        question_image_url: q.question_image_url || ""
+      };
+    });
+
+    const questionSetId = `set-${Math.random().toString(36).substr(2, 9)}`;
+    const firestoreSetPath = `questionSets/${questionSetId}`;
+
+    const worksheetId = `worksheet-${Math.random().toString(36).substr(2, 9)}`;
+    const firestoreWorksheetPath = `worksheets/${worksheetId}`;
+
+    // Compatibility Document for overall Dashboard features
     const newSet: QuestionSet = {
       id: questionSetId,
       userId: user.uid,
@@ -779,28 +905,56 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
       exam: exam.trim() || "General Practice",
       year: year.trim() || new Date().getFullYear().toString(),
       questionsCount: questions.length,
-      questions: questions.map((q, idx) => ({
+      questions: sanitizedQuestions.map((q) => ({
         ...q,
+        // Set questionImage compatibility url to use Cloudinary
+        questionImage: q.question_image_url || undefined,
         subject: subject.trim(),
         exam: exam.trim() || "General Practice",
         year: year.trim() || new Date().getFullYear().toString()
       })),
-      createdAt: new Date() // Will convert correctly inside Firestore batch or setDoc
+      createdAt: new Date()
+    };
+
+    // The official Worksheet schema specified
+    const newWorksheet = {
+      id: worksheetId,
+      userId: user.uid,
+      title: subject.trim(),
+      questions: sanitizedQuestions.map((q) => ({
+        question_text: q.questionText,
+        question_image_url: q.question_image_url || "",
+        options: q.options,
+        correct_option_index: q.correctOptionIndex === -1 ? null : q.correctOptionIndex,
+        explanation: q.explanation || "",
+        subject: subject.trim(),
+        topic: q.subject || exam.trim() || subject.trim()
+      })),
+      createdAt: new Date()
     };
 
     try {
       if (dbOnline) {
         const batch = writeBatch(db);
-        const setDocRef = doc(collection(db, "questionSets"), questionSetId);
         
-        // Formulate Firestore data strictly compatible with the blueprint rules
+        // Write the questionSets compatibility doc for dashboard and lists
+        const setDocRef = doc(collection(db, "questionSets"), questionSetId);
         batch.set(setDocRef, {
           ...newSet,
           createdAt: Timestamp.now()
         });
+
+        // Write the permanent worksheets storage doc targeting scientific visuals
+        const worksheetDocRef = doc(collection(db, "worksheets"), worksheetId);
+        batch.set(worksheetDocRef, {
+          ...newWorksheet,
+          createdAt: Timestamp.now()
+        });
+
         await batch.commit();
+        console.log(`[Firestore Commit] Saved both questionSet (${questionSetId}) and worksheet (${worksheetId}) successfully.`);
       } else {
-        // Fallback save in localStorage for local sandbox environment
+        // LocalStorage sandbox fallback
         const localSets = JSON.parse(localStorage.getItem("mockgo_question_sets") || "[]");
         localSets.push({
           ...newSet,
@@ -808,6 +962,15 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
           createdAt: new Date().toISOString()
         });
         localStorage.setItem("mockgo_question_sets", JSON.stringify(localSets));
+
+        const localWorksheets = JSON.parse(localStorage.getItem("mockgo_worksheets") || "[]");
+        localWorksheets.push({
+          ...newWorksheet,
+          id: worksheetId,
+          createdAt: new Date().toISOString()
+        });
+        localStorage.setItem("mockgo_worksheets", JSON.stringify(localWorksheets));
+        console.log(`[LocalStorage Commit] Saved both questionSet and worksheet locally.`);
       }
 
       // Track activity log
@@ -815,19 +978,30 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
       localActivity.unshift({
         type: "upload",
         title: `Uploaded set: ${newSet.subject} (${newSet.exam})`,
-        meta: `${questions.length} questions extracted`,
+        meta: `${questions.length} questions committed with assets`,
         date: new Date().toISOString()
       });
       localStorage.setItem("mockgo_activity", JSON.stringify(localActivity.slice(0, 15)));
 
       onUploadSuccess();
     } catch (e: any) {
-      console.error(e);
-      handleFirestoreError(e, OperationType.CREATE, firestorePath);
+      console.error("[Firestore Error Writing Worksheet]:", e);
+      // Catch "Missing or insufficient permissions" errors.
+      // Call handleFirestoreError block which throws structured JSON inside error MESSAGE
+      try {
+        handleFirestoreError(e, OperationType.CREATE, firestoreWorksheetPath);
+      } catch (thrownErr: any) {
+        setError(`Database Integration Error: ${thrownErr.message}`);
+      }
     } finally {
       setIsSaving(false);
     }
   };
+
+  const totalWithImages = questions.filter(q => q.question_image_local).length;
+  const pendingCount = questions.filter(q => q.question_image_local && !q.question_image_url && q.image_upload_status === "pending").length;
+  const uploadedCount = questions.filter(q => q.question_image_local && q.question_image_url && q.image_upload_status === "uploaded").length;
+  const failedCount = questions.filter(q => q.question_image_local && q.image_upload_status === "failed").length;
 
   return (
     <div className="w-full h-full text-zinc-100 flex flex-col gap-6 max-w-5xl mx-auto pb-12 font-sans relative">
@@ -1073,6 +1247,21 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
       {/* Worksheet Review Section */}
       {questions.length > 0 && (
         <div className="flex flex-col gap-6 animate-fade-in">
+          {/* Cloudizing Visual Assets Ribbon/Banner */}
+          {pendingCount > 0 && (
+            <div className="bg-emerald-950/20 border border-emerald-900/60 text-emerald-300 p-4 rounded-lg text-xs flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 animate-fade-in shadow-lg shadow-emerald-950/10">
+              <div className="flex items-center gap-2">
+                <span className="relative flex h-2 w-2 shrink-0">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+                <span className="font-semibold font-mono uppercase tracking-wider text-emerald-200">Cloudizing Visual Assets...</span>
+              </div>
+              <span className="font-mono text-[11px] text-zinc-300">
+                Syncing extracted diagrams: <strong className="text-emerald-400">{uploadedCount}</strong> secured, <strong className="text-amber-400 animate-pulse">{pendingCount}</strong> pending, <strong className="text-rose-450">{failedCount}</strong> failed out of <strong className="text-white">{totalWithImages}</strong> scientific visuals.
+              </span>
+            </div>
+          )}
           {/* Collapse/Expand Toggle for Gemini API Debug diagnostics */}
           {geminiDebug && (
             <div className="flex justify-end">
@@ -1476,20 +1665,51 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
                   </div>
 
                   {/* Attached Question Visual Diagram (Scientific Preservation) */}
-                  {q.questionImage && (
+                  {(q.question_image_local || q.question_image_url || q.questionImage) && (
                     <div className="pl-9 pr-2 max-w-full">
                       <div className="relative border border-zinc-800 bg-zinc-900/40 rounded p-3 flex flex-col gap-2 overflow-hidden group">
                         <span className="text-[9px] text-zinc-500 font-mono uppercase tracking-wider font-semibold">Isolated Diagram / Mathematical Equation Preserved</span>
                         <img 
-                          src={q.questionImage} 
+                          src={q.question_image_local || q.question_image_url || q.questionImage} 
                           alt={`Visual diagram for question ${qIdx + 1}`}
                           className="max-h-72 object-contain rounded border border-zinc-800 bg-slate-50 p-2"
                           referrerPolicy="no-referrer"
                         />
+                        
+                        {/* Real-time Cloudinary persistence pipeline upload status indicator */}
+                        {(q.question_image_local) && (
+                          <div className="flex items-center gap-1.5 font-mono text-[9px] border-t border-zinc-900 pt-2 mt-1">
+                            {q.image_upload_status === "pending" && (
+                              <span className="text-amber-400 animate-pulse flex items-center gap-1">
+                                <span className="h-1 w-1 rounded-full bg-amber-400 animate-ping" />
+                                <span>Uploading visual asset asynchronously to Cloudinary...</span>
+                              </span>
+                            )}
+                            {q.image_upload_status === "uploaded" && (
+                              <span className="text-emerald-400 flex items-center gap-1 font-semibold">
+                                <span>✔</span>
+                                <span>Permasecure Cloud Copy Saved</span>
+                              </span>
+                            )}
+                            {q.image_upload_status === "failed" && (
+                              <span className="text-rose-400 flex items-center gap-1">
+                                <span>✖</span>
+                                <span>Bypassed cloud copy (Using secure local preview)</span>
+                              </span>
+                            )}
+                          </div>
+                        )}
+
                         <button
                           type="button"
                           onClick={() => {
-                            setQuestions(questions.map(item => item.id === q.id ? { ...item, questionImage: undefined } : item));
+                            setQuestions(questions.map(item => item.id === q.id ? { 
+                              ...item, 
+                              questionImage: undefined, 
+                              question_image_local: undefined, 
+                              question_image_url: undefined, 
+                              image_upload_status: undefined 
+                            } : item));
                           }}
                           className="absolute top-3 right-3 opacity-0 group-hover:opacity-100 bg-red-950/80 hover:bg-red-900 border border-red-800 text-red-200 text-[10px] uppercase font-mono px-2 py-1 rounded transition-opacity"
                         >
@@ -1554,6 +1774,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
           {/* Action Row */}
           <div className="border-t border-zinc-900 pt-6 flex justify-between items-center gap-4">
             <button
+              type="button"
               onClick={() => {
                 setQuestions([]);
                 setFile(null);
@@ -1564,18 +1785,35 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c.rawChunkText}`).join("\n\n---\n\n")}
               Discard and Reset
             </button>
 
-            <button
-              onClick={handleSaveSet}
-              disabled={isSaving}
-              className="flex items-center gap-2 bg-white text-black font-semibold text-xs px-5 py-2.5 rounded hover:bg-zinc-200 transition-colors disabled:opacity-50"
-            >
-              {isSaving ? (
-                <div className="w-3.5 h-3.5 border-2 border-black border-t-transparent rounded-full animate-spin" />
-              ) : (
-                <Save className="w-3.5 h-3.5" />
-              )}
-              <span>Import to Firestore Collection</span>
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handleSaveSet}
+                disabled={isSaving}
+                className="flex items-center gap-2 bg-zinc-900 text-zinc-300 font-semibold text-xs px-4 py-2.5 rounded border border-zinc-800 hover:bg-zinc-850 hover:text-white transition-colors disabled:opacity-50 font-mono"
+              >
+                {isSaving ? (
+                  <div className="w-3.5 h-3.5 border-2 border-zinc-400 border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <Sparkles className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                )}
+                <span>Generate Mocks</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleSaveSet}
+                disabled={isSaving}
+                className="flex items-center gap-2 bg-white text-black font-semibold text-xs px-5 py-2.5 rounded hover:bg-zinc-200 transition-colors disabled:opacity-50"
+              >
+                {isSaving ? (
+                  <div className="w-3.5 h-3.5 border-2 border-black border-t-transparent rounded-full animate-spin" />
+                ) : (
+                  <Save className="w-3.5 h-3.5 shrink-0" />
+                )}
+                <span>Commit Worksheet</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -58,6 +58,14 @@ service cloud.firestore {
         && (data.status == "pending" || data.status == "completed");
     }
 
+    function isValidWorksheet(data) {
+      return data.userId is string 
+        && data.userId.size() <= 128
+        && data.title is string 
+        && data.title.size() <= 256
+        && data.questions is list;
+    }
+
     // Collection: questionSets
     match /questionSets/{setId} {
       allow get: if isSignedIn() && existing().userId == request.auth.uid;
@@ -103,6 +111,29 @@ service cloud.firestore {
           && isValidMockTest(incoming())
           && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'answers', 'score', 'correctCount', 'wrongCount', 'unansweredCount', 'completedAt'])
         );
+
+      allow delete: if isSignedIn()
+        && existing().userId == request.auth.uid;
+    }
+
+    // Collection: worksheets
+    match /worksheets/{worksheetId} {
+      allow get: if isSignedIn() && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() 
+        && isValidId(worksheetId)
+        && incoming().userId == request.auth.uid
+        && incoming().createdAt == request.time
+        && isValidWorksheet(incoming());
+
+      allow update: if isSignedIn()
+        && isValidId(worksheetId)
+        && existing().userId == request.auth.uid
+        && incoming().userId == request.auth.uid
+        && incoming().createdAt == existing().createdAt
+        && isValidWorksheet(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['title', 'questions']);
 
       allow delete: if isSignedIn()
         && existing().userId == request.auth.uid;

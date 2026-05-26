@@ -12,6 +12,27 @@ export interface Question {
   isAiCleaned?: boolean;
   rawChunkText?: string;
   questionImage?: string;
+  question_image_local?: string;
+  question_image_url?: string;
+  image_upload_status?: "pending" | "uploaded" | "failed";
+}
+
+export interface WorksheetQuestion {
+  question_text: string;
+  question_image_url?: string;
+  options: string[];
+  correct_option_index: number | null;
+  explanation: string;
+  subject: string;
+  topic: string;
+}
+
+export interface Worksheet {
+  id?: string;
+  userId: string;
+  title: string;
+  createdAt: any; // Firestore Timestamp
+  questions: WorksheetQuestion[];
 }
 
 export interface QuestionSet {

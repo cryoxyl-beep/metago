@@ -56,6 +56,23 @@
         "unansweredCount": { "type": "integer" }
       },
       "required": ["userId", "title", "questionSetIds", "questions", "numQuestions", "timeLimit", "markingScheme", "status", "createdAt"]
+    },
+    "Worksheet": {
+      "title": "Worksheet",
+      "description": "A permanent worksheet dataset with uploaded scientific images and question details.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "The unique ID of the worksheet." },
+        "userId": { "type": "string", "description": "The firebase UID of the creator." },
+        "title": { "type": "string", "description": "Display name of the worksheet." },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "questions": {
+          "type": "array",
+          "description": "List of questions inside the worksheet.",
+          "items": { "type": "object" }
+        }
+      },
+      "required": ["userId", "title", "createdAt", "questions"]
     }
   },
   "firestore": {
@@ -66,6 +83,10 @@
     "mockTests/{mockId}": {
       "schema": "MockTest",
       "description": "Collection storing mock test sessions and outcomes."
+    },
+    "worksheets/{worksheetId}": {
+      "schema": "Worksheet",
+      "description": "Collection storing worksheets permanently."
     }
   }
 }
