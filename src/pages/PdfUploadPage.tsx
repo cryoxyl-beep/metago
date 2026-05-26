@@ -1,7 +1,7 @@
 import React, { useState, useRef } from "react";
 import { useAuth } from "../firebase/context";
 import { extractTextFromPdf, parseQuestionsFromText, assessChunkConfidence } from "../parsing/pdfParser";
-import { Question, QuestionSet } from "../types";
+import { Question, QuestionSet, OcrTelemetry } from "../types";
 import { collection, doc, writeBatch, Timestamp } from "firebase/firestore";
 import { db, handleFirestoreError, OperationType } from "../firebase/config";
 import { 
@@ -48,6 +48,7 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   const [parserConfidence, setParserConfidence] = useState<number | null>(null);
   const [aiCleanedCount, setAiCleanedCount] = useState<number>(0);
   const [isAiCleaning, setIsAiCleaning] = useState<boolean>(false);
+  const [ocrTelemetry, setOcrTelemetry] = useState<OcrTelemetry | null>(null);
 
   // Handle local PDF upload
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -313,17 +314,24 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
     setExtracting(true);
     setParserConfidence(null);
     setAiCleanedCount(0);
+    setOcrTelemetry(null);
     setError(null);
     setWarning(null);
     setProgress({ current: 0, total: 0 });
     setExtractionStage("Initializing multi-stage extraction...");
     try {
-      const text = await extractTextFromPdf(pdfFile, (current, total, stage) => {
-        setProgress({ current, total });
-        if (stage) {
-          setExtractionStage(stage);
+      const text = await extractTextFromPdf(
+        pdfFile, 
+        (current, total, stage) => {
+          setProgress({ current, total });
+          if (stage) {
+            setExtractionStage(stage);
+          }
+        },
+        (telemetry) => {
+          setOcrTelemetry(telemetry);
         }
-      });
+      );
       
       setRawText(text);
       const parsed = parseQuestionsFromText(text);
@@ -651,16 +659,44 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
           />
 
           {extracting ? (
-            <div className="flex flex-col items-center gap-3">
+            <div className="flex flex-col items-center gap-3 w-full">
               <div className="w-8 h-8 border-2 border-white border-t-transparent rounded-full animate-spin mb-2" />
-              <p className="text-sm text-zinc-300 font-medium font-mono text-amber-200">
+              <p className="text-sm text-zinc-300 font-medium font-mono text-amber-200 text-center">
                 {extractionStage || "Extracting PDF structures..."}
               </p>
               {progress.total > 0 && (
-                <span className="text-xs text-zinc-500 font-mono">
+                <span className="text-xs text-zinc-500 font-mono text-center">
                   Page {progress.current} of {progress.total}
                 </span>
               )}
+              {ocrTelemetry?.lowTextPagesCount && ocrTelemetry.lowTextPagesCount > 0 ? (
+                <div className="mt-3 flex flex-col items-center gap-1.5 max-w-sm bg-zinc-900 border border-zinc-800 p-4 rounded-lg text-left w-full animate-fade-in font-mono text-[11px] text-zinc-400 cursor-default" onClick={(e) => e.stopPropagation()}>
+                  <div className="flex justify-between w-full border-b border-zinc-800 pb-1.5 mb-1 text-zinc-300 font-semibold uppercase text-[10px]">
+                    <span>OCR Real-time Telemetry</span>
+                    <span className="text-amber-400 animate-pulse">Scanning...</span>
+                  </div>
+                  <div className="flex justify-between w-full">
+                    <span>Low-text pages:</span>
+                    <span className="text-zinc-200 font-bold">{ocrTelemetry.lowTextPagesCount} detected</span>
+                  </div>
+                  <div className="flex justify-between w-full">
+                    <span>OCR Pages Scanned:</span>
+                    <span className="text-zinc-200 font-bold">{ocrTelemetry.ocrPagesProcessed}</span>
+                  </div>
+                  <div className="flex justify-between w-full">
+                    <span>OCR Successful:</span>
+                    <span className="text-emerald-400 font-bold">{ocrTelemetry.ocrSuccessCount}</span>
+                  </div>
+                  <div className="flex justify-between w-full">
+                    <span>OCR Failed/Dismissed:</span>
+                    <span className="text-rose-400 font-bold">{ocrTelemetry.ocrFailureCount}</span>
+                  </div>
+                  <div className="flex justify-between w-full">
+                    <span>OCR Elapsed Time:</span>
+                    <span className="text-amber-400">{(ocrTelemetry.ocrDurationMs / 1000).toFixed(1)}s</span>
+                  </div>
+                </div>
+              ) : null}
             </div>
           ) : (
             <>
@@ -754,6 +790,120 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
                   <p className="text-[11px] text-zinc-500 mt-1">
                     Mashed or low-confidence layouts semantically restored with Gemini Flash.
                   </p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* OCR Metrics & Diagnostics Panel */}
+          {ocrTelemetry && ocrTelemetry.lowTextPagesCount > 0 && (
+            <div className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg flex flex-col gap-4">
+              <h3 className="text-xs font-semibold tracking-wider text-zinc-400 flex items-center justify-between uppercase">
+                <div className="flex items-center gap-1.5">
+                  <span className="relative flex h-2 w-2">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-amber-500"></span>
+                  </span>
+                  <span>Hybrid Client-Side OCR Diagnostics</span>
+                </div>
+                <span className="bg-zinc-900 text-zinc-400 text-[10px] font-mono px-2 py-0.5 rounded border border-zinc-805">
+                  Tesseract.js ("eng") fallback engine
+                </span>
+              </h3>
+
+              {ocrTelemetry.ocrLimitExceeded && (
+                <div className="bg-amber-950/20 border border-amber-900/40 text-amber-355 p-3 rounded-md text-[11px] flex gap-2 items-center">
+                  <AlertCircle className="w-4 h-4 shrink-0 text-amber-500" />
+                  <span>OCR fallback limited to first 5 low-text pages for performance stability. Prioritized by lowest character density first.</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="bg-zinc-900/40 p-4 rounded border border-zinc-900 flex flex-col justify-center">
+                  <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider mb-1">OCR Pages Processed</p>
+                  <p className="text-xl font-bold tracking-tight font-mono text-zinc-200">
+                    {ocrTelemetry.ocrPagesProcessed} / {ocrTelemetry.lowTextPagesCount}
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    Number of scanned pages where native characters fell under 150.
+                  </p>
+                </div>
+
+                <div className="bg-zinc-900/40 p-4 rounded border border-zinc-900 flex flex-col justify-center">
+                  <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider mb-1">OCR Success Count</p>
+                  <p className="text-xl font-bold tracking-tight font-mono text-emerald-400">
+                    {ocrTelemetry.ocrSuccessCount} Saved
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    Pages successfully transcribed with confidence above 30%.
+                  </p>
+                </div>
+
+                <div className="bg-zinc-900/40 p-4 rounded border border-zinc-900 flex flex-col justify-center">
+                  <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider mb-1">OCR Dismissed/Failed</p>
+                  <p className="text-xl font-bold tracking-tight font-mono text-zinc-400">
+                    {ocrTelemetry.ocrFailureCount} Discarded
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    Pages discarded due to low OCR confidence or scan failure.
+                  </p>
+                </div>
+
+                <div className="bg-zinc-900/40 p-4 rounded border border-zinc-900 flex flex-col justify-center">
+                  <p className="text-[10px] text-zinc-500 font-mono uppercase tracking-wider mb-1">OCR Engine Duration</p>
+                  <p className="text-xl font-bold tracking-tight font-mono text-amber-400 font-semibold">
+                    {(ocrTelemetry.ocrDurationMs / 1000).toFixed(1)}s
+                  </p>
+                  <p className="text-[11px] text-zinc-500 mt-1">
+                    Total client-side execution time of Tesseract.js WebAssembly workers.
+                  </p>
+                </div>
+              </div>
+
+              {/* Individual Page Logs Row */}
+              <div className="mt-2 flex flex-col gap-1.5">
+                <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-wider">Interactive Page-Level Log Table</span>
+                <div className="border border-zinc-900 rounded overflow-hidden max-h-36 overflow-y-auto font-mono text-[10px]">
+                  <table className="w-full text-left text-zinc-400">
+                    <thead className="bg-zinc-900 text-zinc-500 uppercase text-[9px] border-b border-zinc-900 sticky top-0">
+                      <tr>
+                        <th className="p-2">Page No.</th>
+                        <th className="p-2">Initial Chars</th>
+                        <th className="p-2">Status</th>
+                        <th className="p-2">Confidence</th>
+                        <th className="p-2">Final Chars</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-zinc-900">
+                      {ocrTelemetry.pagesHandled.map((page, index) => (
+                        <tr key={index} className="hover:bg-zinc-900/30">
+                          <td className="p-2 font-semibold">Page {page.pageNum}</td>
+                          <td className="p-2">{page.initialLength}</td>
+                          <td className="p-2">
+                            <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-bold tracking-wider ${
+                              page.status === 'ocr-success' ? 'bg-emerald-950/50 text-emerald-400 border border-emerald-950' :
+                              page.status === 'ocr-discarded' ? 'bg-zinc-900 text-zinc-500 border border-zinc-800' :
+                              page.status === 'ocr-failed' ? 'bg-rose-955/45 text-rose-400 border border-rose-900/55' :
+                              page.status === 'ocr-skipped' ? 'bg-amber-950/45 text-amber-500 border border-amber-900/55' :
+                              'bg-zinc-950 text-zinc-600'
+                            }`}>
+                              {page.status === 'ocr-success' ? 'OCR MERGED' :
+                               page.status === 'ocr-discarded' ? 'DISCARDED' :
+                               page.status === 'ocr-failed' ? 'FAILED' :
+                               page.status === 'ocr-skipped' ? 'LIMIT BYPASSED' :
+                               'NATIVE ONLY'}
+                            </span>
+                          </td>
+                          <td className="p-2">
+                            {page.ocrConfidence !== null ? `${page.ocrConfidence}%` : 'N/A'}
+                          </td>
+                          <td className="p-2">
+                            {page.finalLength} {page.ocrTextLength > 0 && `(+${page.ocrTextLength} OCR)`}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
                 </div>
               </div>
             </div>

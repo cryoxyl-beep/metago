@@ -1,5 +1,6 @@
 import * as pdfjsLib from "pdfjs-dist";
-import { Question } from "../types";
+import { Question, OcrTelemetry } from "../types";
+import { createWorker } from "tesseract.js";
 
 // Setup stable Vite-compatible worker source using local dependency resolution
 if (typeof window !== "undefined") {
@@ -10,36 +11,53 @@ if (typeof window !== "undefined") {
 }
 
 /**
- * Extracts plain text from a PDF file using a highly resilient multi-stage pipeline.
- * Features automated fallbacks for malformed encodings, normalization control, and raw recovery pass.
+ * Extracts plain text from a PDF file using a highly resilient multi-stage pipeline with client-side OCR fallback.
+ * Features automated fallbacks for malformed encodings, normalization control, and selective Tesseract.js OCR engine execution.
  */
 export async function extractTextFromPdf(
   file: File,
-  onProgress?: (current: number, total: number, stage?: string) => void
+  onProgress?: (current: number, total: number, stage?: string) => void,
+  onOcrTelemetry?: (telemetry: OcrTelemetry) => void
 ): Promise<string> {
   const arrayBuffer = await file.arrayBuffer();
   const loadingTask = pdfjsLib.getDocument({ data: arrayBuffer });
   const pdf = await loadingTask.promise;
   
-  let fullText = "";
   const totalPages = pdf.numPages;
-  let totalPageItems = 0;
-  let succeededPagesCount = 0;
+  
+  // Track detailed per-page information for evaluation and telemetry
+  interface PageExtraction {
+    pageNum: number;
+    text: string;
+    itemsCount: number;
+    initialLength: number;
+    isLowText: boolean;
+    ocrEligible: boolean;
+    ocrTriggered: boolean;
+    ocrConfidence: number | null;
+    ocrTextLength: number;
+    finalLength: number;
+    status: "native" | "ocr-success" | "ocr-discarded" | "ocr-failed" | "ocr-skipped";
+  }
 
+  const pageExtractions: PageExtraction[] = [];
+
+  // ==========================================
+  // PHASE 1 — NATIVE PDF TEXT EXTRACTION PASS
+  // ==========================================
   for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
     let pageText = "";
     let itemsCount = 0;
     let pageParsedOk = false;
 
+    if (onProgress) {
+      onProgress(pageNum, totalPages, `Phase 1: Native layout extraction on page ${pageNum}...`);
+    }
+
     try {
       const page = await pdf.getPage(pageNum);
 
-      // ==========================================
-      // STAGE 1 — STANDARD PDF.js EXTRACTION
-      // ==========================================
-      if (onProgress) {
-        onProgress(pageNum, totalPages, "Stage 1 — Standard Layout Extraction");
-      }
+      // Stage 1 — Standard PDF.js Extraction
       try {
         const textContent = await page.getTextContent();
         itemsCount = textContent.items.length;
@@ -47,8 +65,6 @@ export async function extractTextFromPdf(
           .filter(item => item && typeof item === "object" && "str" in item)
           .map(item => (item as any).str)
           .join(" ");
-
-        console.log(`[PDF Parser Stage 1] Page ${pageNum}/${totalPages}: items.length = ${itemsCount}, text.length = ${stage1Text.length} chars. Sample: "${stage1Text.substring(0, 100)}"`);
 
         if (stage1Text.trim().length > 10) {
           pageText = stage1Text;
@@ -58,13 +74,8 @@ export async function extractTextFromPdf(
         console.warn(`[PDF Parser] Stage 1 failed on page ${pageNum}:`, stage1Err);
       }
 
-      // ==========================================
-      // STAGE 2 — DISABLE NORMALIZATION
-      // ==========================================
+      // Stage 2 — Disable Layout Normalization
       if (!pageParsedOk) {
-        if (onProgress) {
-          onProgress(pageNum, totalPages, "Stage 2 — Disabling Layout Normalization");
-        }
         try {
           const textContent = await page.getTextContent({ disableNormalization: true });
           itemsCount = textContent.items.length;
@@ -72,8 +83,6 @@ export async function extractTextFromPdf(
             .filter(item => item && typeof item === "object" && "str" in item)
             .map(item => (item as any).str)
             .join(" ");
-
-          console.log(`[PDF Parser Stage 2] Page ${pageNum}/${totalPages}: items.length = ${itemsCount}, text.length = ${stage2Text.length} chars. Sample: "${stage2Text.substring(0, 100)}"`);
 
           if (stage2Text.trim().length > 10) {
             pageText = stage2Text;
@@ -84,16 +93,9 @@ export async function extractTextFromPdf(
         }
       }
 
-      // ==========================================
-      // STAGE 3 — RAW COORDINATE / TOKEN RECOVERY
-      // ==========================================
+      // Stage 3 — Raw Coordination Pass
       if (!pageParsedOk) {
-        if (onProgress) {
-          onProgress(pageNum, totalPages, "Stage 3 — Raw Token Recovery Mode");
-        }
         try {
-          // Attempt raw coordinate recovery pass. We grab everything resembling text,
-          // ignore layout structuring entirely, and prioritize character retrieval.
           const textContent = await page.getTextContent().catch(() => 
             page.getTextContent({ disableNormalization: true })
           );
@@ -109,7 +111,6 @@ export async function extractTextFromPdf(
               if ("str" in item && typeof (item as any).str === "string") {
                 recoveredTokens.push((item as any).str);
               } else {
-                // Recover any string-like properties
                 for (const key of Object.keys(item)) {
                   const val = (item as any)[key];
                   if (typeof val === "string" && val.trim().length > 0) {
@@ -121,8 +122,6 @@ export async function extractTextFromPdf(
           }
 
           const stage3Text = recoveredTokens.join(" ");
-          console.log(`[PDF Parser Stage 3] Page ${pageNum}/${totalPages}: items.length = ${itemsCount}, text.length = ${stage3Text.length} chars. Sample: "${stage3Text.substring(0, 100)}"`);
-
           if (stage3Text.trim().length > 0) {
             pageText = stage3Text;
             pageParsedOk = true;
@@ -132,31 +131,209 @@ export async function extractTextFromPdf(
         }
       }
 
-      totalPageItems += itemsCount;
-
-      if (pageText.trim().length > 0) {
-        fullText += pageText + "\n\n";
-        succeededPagesCount++;
-      } else {
-        // Even if empty, add a small space gap to keep page separation
-        fullText += `[RAW PAGE ${pageNum} UNREADABLE]\n\n`;
-      }
-
     } catch (pageErr) {
       console.error(`[PDF Parser] Extreme failure loading page ${pageNum}:`, pageErr);
-      fullText += `[PAGE ${pageNum} STRUCTURAL FAILURE]\n\n`;
     }
 
-    if (onProgress) {
-      onProgress(pageNum, totalPages, "Finalizing pages");
-    }
+    const initialLength = pageText.trim().length;
+    const isLowText = initialLength < 150; // LOW_TEXT_THRESHOLD
+
+    pageExtractions.push({
+      pageNum,
+      text: pageText,
+      itemsCount,
+      initialLength,
+      isLowText,
+      ocrEligible: isLowText,
+      ocrTriggered: false,
+      ocrConfidence: null,
+      ocrTextLength: 0,
+      finalLength: initialLength,
+      status: isLowText ? "ocr-skipped" : "native"
+    });
+
+    console.log(`[PDF Native Pass] Page ${pageNum}/${totalPages}: length=${initialLength}, lowText=${isLowText}`);
   }
 
   // ==========================================
-  // STAGE 4 — PARTIAL SUCCESS MODE
+  // PHASE 2 — HYBRID SELECTIVE OCR FALLBACK
   // ==========================================
-  // ONLY show a fatal error if every single page has 0 raw items of data AND the entire string list is empty.
-  // Otherwise, fallback mode always yields whatever readable text is recovered.
+  const lowTextPages = pageExtractions.filter(pe => pe.isLowText);
+  const lowTextPagesCount = lowTextPages.length;
+  let ocrPagesProcessed = 0;
+  let ocrSuccessCount = 0;
+  let ocrFailureCount = 0;
+  const ocrStartTime = performance.now();
+  
+  // Sort candidate low-text pages in ascending order of initial length (lowest first!)
+  lowTextPages.sort((a, b) => a.initialLength - b.initialLength);
+
+  // Maximum of 5 pages evaluated for performance and safety
+  const MAX_OCR_PAGES = 5;
+  const ocrCandidates = lowTextPages.slice(0, MAX_OCR_PAGES);
+  const ocrLimitExceeded = lowTextPages.length > MAX_OCR_PAGES;
+
+  let worker: any = null;
+
+  if (ocrCandidates.length > 0) {
+    try {
+      console.log(`[OCR Pipeline] Low-text pages detected: ${lowTextPagesCount}. Standard OCR Fallback active.`);
+      if (onProgress) {
+        onProgress(0, ocrCandidates.length, "Stage 4: Initializing browser OCR engine...");
+      }
+      worker = await createWorker("eng");
+      console.log(`[OCR Pipeline] Tesseract.js Worker loaded successfully.`);
+    } catch (workerInitErr) {
+      console.error(`[OCR Pipeline] Worker initialization failed:`, workerInitErr);
+    }
+  }
+
+  if (worker && ocrCandidates.length > 0) {
+    for (let i = 0; i < ocrCandidates.length; i++) {
+      const pe = ocrCandidates[i];
+      const targetPE = pageExtractions.find(p => p.pageNum === pe.pageNum);
+      if (!targetPE) continue;
+
+      targetPE.ocrTriggered = true;
+      ocrPagesProcessed++;
+
+      console.log(`[OCR Pipeline] Processing page ${pe.pageNum} (${i + 1}/${ocrCandidates.length}). Density: ${pe.initialLength} chars.`);
+      if (onProgress) {
+        onProgress(i + 1, ocrCandidates.length, `Stage 4: OCR scanning low-text page ${pe.pageNum}...`);
+      }
+
+      const pageStartTime = performance.now();
+
+      try {
+        const pageObj = await pdf.getPage(pe.pageNum);
+        // Render scale 2.5x to improve accuracy on tiny math texts & compressions
+        const scale = 2.5;
+        const viewport = pageObj.getViewport({ scale });
+        
+        const canvas = document.createElement("canvas");
+        const context = canvas.getContext("2d");
+        if (!context) {
+          throw new Error("Unable to create offscreen canvas context");
+        }
+
+        canvas.height = viewport.height;
+        canvas.width = viewport.width;
+
+        const renderContext = {
+          canvasContext: context,
+          viewport: viewport,
+          canvas: canvas
+        } as any;
+
+        // Render PDF page onto high-resolution canvas
+        await pageObj.render(renderContext).promise;
+
+        // Obtain image dataURL
+        const imgDataUrl = canvas.toDataURL("image/png");
+
+        // Run Tesseract OCR on page
+        const { data: { text, confidence } } = await worker.recognize(imgDataUrl);
+        const latency = performance.now() - pageStartTime;
+
+        console.log(`[OCR Pipeline] Page ${pe.pageNum} OCR completed in ${latency.toFixed(0)}ms. Confidence: ${confidence}%. Text length: ${text?.length || 0}`);
+
+        // Safety: Discard low-confidence or corrupted outputs
+        const MIN_OCR_CONFIDENCE = 30; // Min confidence percentage
+        const cleanOcrText = (text || "").trim();
+
+        if (confidence >= MIN_OCR_CONFIDENCE && cleanOcrText.length > 5) {
+          targetPE.ocrConfidence = confidence;
+          targetPE.ocrTextLength = cleanOcrText.length;
+          
+          // Merge PDF.js standard text & OCR recovered text
+          const mergedText = (targetPE.text + "\n\n" + cleanOcrText).trim();
+          targetPE.text = mergedText;
+          targetPE.finalLength = mergedText.length;
+          targetPE.status = "ocr-success";
+          ocrSuccessCount++;
+        } else {
+          targetPE.status = "ocr-discarded";
+          ocrFailureCount++;
+          console.warn(`[OCR Pipeline] Discarded OCR text for page ${pe.pageNum} due to low confidence/character constraints`);
+        }
+
+      } catch (ocrPageErr: any) {
+        targetPE.status = "ocr-failed";
+        ocrFailureCount++;
+        console.error(`[OCR Pipeline] Failed to perform OCR scan on page ${pe.pageNum}:`, ocrPageErr);
+      }
+
+      // Fire intermediate progress telemetry updates
+      if (onOcrTelemetry) {
+        onOcrTelemetry({
+          lowTextPagesCount,
+          ocrPagesProcessed,
+          ocrDurationMs: Math.round(performance.now() - ocrStartTime),
+          ocrSuccessCount,
+          ocrFailureCount,
+          ocrLimitExceeded,
+          pagesHandled: pageExtractions.map(p => ({
+            pageNum: p.pageNum,
+            initialLength: p.initialLength,
+            ocrEligible: p.ocrEligible,
+            ocrTriggered: p.ocrTriggered,
+            ocrConfidence: p.ocrConfidence,
+            ocrTextLength: p.ocrTextLength,
+            finalLength: p.finalLength,
+            status: p.status
+          }))
+        });
+      }
+    }
+  }
+
+  // Gracefully terminate the worker to prevent resource/worker memory leaks
+  if (worker) {
+    try {
+      await worker.terminate();
+      console.log("[OCR Pipeline] Tesseract worker terminated cleanly.");
+    } catch (termErr) {
+      console.error("[OCR Pipeline] Error terminating worker:", termErr);
+    }
+  }
+
+  // Ensure telemetry is fired at least once after everything finishes
+  if (onOcrTelemetry) {
+    onOcrTelemetry({
+      lowTextPagesCount,
+      ocrPagesProcessed,
+      ocrDurationMs: Math.round(performance.now() - ocrStartTime),
+      ocrSuccessCount,
+      ocrFailureCount,
+      ocrLimitExceeded,
+      pagesHandled: pageExtractions.map(p => ({
+        pageNum: p.pageNum,
+        initialLength: p.initialLength,
+        ocrEligible: p.ocrEligible,
+        ocrTriggered: p.ocrTriggered,
+        ocrConfidence: p.ocrConfidence,
+        ocrTextLength: p.ocrTextLength,
+        finalLength: p.finalLength,
+        status: p.status
+      }))
+    });
+  }
+
+  // Rebuild final structured fullText
+  let fullText = "";
+  let totalPageItems = 0;
+  let succeededPagesCount = 0;
+
+  for (const pe of pageExtractions) {
+    totalPageItems += pe.itemsCount;
+    if (pe.text.trim().length > 0) {
+      fullText += pe.text + "\n\n";
+      succeededPagesCount++;
+    } else {
+      fullText += `[RAW PAGE ${pe.pageNum} UNREADABLE]\n\n`;
+    }
+  }
+
   const trimmedFullText = fullText.trim();
   const fullyEmpty = totalPageItems === 0 && trimmedFullText.replace(/\[RAW PAGE \d+ UNREADABLE\]|\[PAGE \d+ STRUCTURAL FAILURE\]/g, "").trim().length === 0;
 
@@ -166,7 +343,7 @@ export async function extractTextFromPdf(
     );
   }
 
-  console.log(`[PDF Parser Completed] Successfully parsed content across multi-stage pipeline. Succeeded pages: ${succeededPagesCount}/${totalPages}. Total extracted length: ${trimmedFullText.length} characters.`);
+  console.log(`[PDF Parser Completed] Succeeded pages: ${succeededPagesCount}/${totalPages}. OCR: processed ${ocrPagesProcessed}, success ${ocrSuccessCount}, failure ${ocrFailureCount}. Total text length: ${trimmedFullText.length}`);
   return fullText;
 }
 

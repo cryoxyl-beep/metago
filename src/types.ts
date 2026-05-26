@@ -50,4 +50,23 @@ export interface MockTest {
   unansweredCount?: number;
 }
 
+export interface OcrTelemetry {
+  lowTextPagesCount: number;
+  ocrPagesProcessed: number;
+  ocrDurationMs: number;
+  ocrSuccessCount: number;
+  ocrFailureCount: number;
+  ocrLimitExceeded: boolean;
+  pagesHandled: {
+    pageNum: number;
+    initialLength: number;
+    ocrEligible: boolean;
+    ocrTriggered: boolean;
+    ocrConfidence: number | null;
+    ocrTextLength: number;
+    finalLength: number;
+    status: "native" | "ocr-success" | "ocr-discarded" | "ocr-failed" | "ocr-skipped";
+  }[];
+}
+
 export type AppView = "dashboard" | "upload" | "setup-mock" | "mock-test" | "results" | "auth";
