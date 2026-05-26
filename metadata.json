@@ -1,0 +1,6 @@
+{
+  "name": "Mock Test Generator",
+  "description": "Generate mock tests from uploaded PYQs by extracting questions with PDF.js and persisting them in Firestore.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,71 @@
+{
+  "entities": {
+    "QuestionSet": {
+      "title": "QuestionSet",
+      "description": "A set of parsed questions extracted from an uploaded PDF PYQ.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "The unique ID of the question set." },
+        "userId": { "type": "string", "description": "The firebase UID of the owner." },
+        "fileName": { "type": "string", "description": "The original name of the PDF file." },
+        "subject": { "type": "string", "description": "Subject of the PYQ paper." },
+        "exam": { "type": "string", "description": "The exam name (e.g. JEE, NEET, UPSC)." },
+        "year": { "type": "string", "description": "The year of the exam paper or PYQ." },
+        "questionsCount": { "type": "integer", "description": "The number of questions in this set." },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp of creation." },
+        "questions": {
+          "type": "array",
+          "description": "The list of parsed MCQ questions.",
+          "items": { "type": "object" }
+        }
+      },
+      "required": ["userId", "fileName", "subject", "exam", "year", "questionsCount", "questions", "createdAt"]
+    },
+    "MockTest": {
+      "title": "MockTest",
+      "description": "An individual mock test session created by a user.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "The unique ID of the mock test." },
+        "userId": { "type": "string", "description": "The firebase UID of the test taker." },
+        "title": { "type": "string", "description": "Display name of the mock test." },
+        "questionSetIds": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "The IDs of the question sets from which questions were randomized."
+        },
+        "questions": {
+          "type": "array",
+          "description": "The actual questions included in this specific mock test.",
+          "items": { "type": "object" }
+        },
+        "numQuestions": { "type": "integer", "description": "Total number of questions in the mock." },
+        "timeLimit": { "type": "integer", "description": "Time limit in minutes." },
+        "markingScheme": {
+          "type": "object",
+          "description": "Marking scheme like positive and negative marks."
+        },
+        "status": { "type": "string", "enum": ["pending", "completed"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "startedAt": { "type": "string", "format": "date-time" },
+        "completedAt": { "type": "string", "format": "date-time" },
+        "answers": { "type": "object", "description": "Selected answers mapping question index to choice index." },
+        "score": { "type": "number", "description": "Calculated score." },
+        "correctCount": { "type": "integer" },
+        "wrongCount": { "type": "integer" },
+        "unansweredCount": { "type": "integer" }
+      },
+      "required": ["userId", "title", "questionSetIds", "questions", "numQuestions", "timeLimit", "markingScheme", "status", "createdAt"]
+    }
+  },
+  "firestore": {
+    "questionSets/{setId}": {
+      "schema": "QuestionSet",
+      "description": "Collection storing parsed question lists for users."
+    },
+    "mockTests/{mockId}": {
+      "schema": "MockTest",
+      "description": "Collection storing mock test sessions and outcomes."
+    }
+  }
+}

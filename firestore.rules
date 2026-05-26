@@ -1,0 +1,111 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reuseable global primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Entity Validations
+    function isValidQuestionSet(data) {
+      return data.userId is string 
+        && data.userId.size() <= 128 
+        && data.fileName is string 
+        && data.fileName.size() <= 256
+        && data.subject is string 
+        && data.subject.size() <= 128
+        && data.exam is string 
+        && data.exam.size() <= 128
+        && data.year is string 
+        && data.year.size() <= 32
+        && data.questionsCount is int
+        && data.questions is list;
+    }
+
+    function isValidMockTest(data) {
+      return data.userId is string 
+        && data.userId.size() <= 128
+        && data.title is string 
+        && data.title.size() <= 256
+        && data.questionSetIds is list
+        && data.questions is list
+        && data.numQuestions is int
+        && data.timeLimit is int
+        && data.markingScheme is map
+        && data.status is string
+        && (data.status == "pending" || data.status == "completed");
+    }
+
+    // Collection: questionSets
+    match /questionSets/{setId} {
+      allow get: if isSignedIn() && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() 
+        && isValidId(setId)
+        && incoming().userId == request.auth.uid
+        && incoming().createdAt == request.time
+        && isValidQuestionSet(incoming());
+
+      allow update: if isSignedIn()
+        && isValidId(setId)
+        && existing().userId == request.auth.uid
+        && incoming().userId == request.auth.uid
+        && incoming().createdAt == existing().createdAt
+        && isValidQuestionSet(incoming())
+        && incoming().diff(existing()).affectedKeys().hasOnly(['subject', 'exam', 'year', 'questions', 'questionsCount']);
+
+      allow delete: if isSignedIn()
+        && existing().userId == request.auth.uid;
+    }
+
+    // Collection: mockTests
+    match /mockTests/{mockId} {
+      allow get: if isSignedIn() && existing().userId == request.auth.uid;
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+
+      allow create: if isSignedIn() 
+        && isValidId(mockId)
+        && incoming().userId == request.auth.uid
+        && incoming().createdAt == request.time
+        && isValidMockTest(incoming());
+
+      allow update: if isSignedIn()
+        && isValidId(mockId)
+        && existing().userId == request.auth.uid
+        && incoming().userId == request.auth.uid
+        // Handle Action: Submit Test (Must be pending, transitions to completed, updates specific outcome-related keys)
+        && (
+          existing().status == "pending"
+          && incoming().status == "completed"
+          && isValidMockTest(incoming())
+          && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'answers', 'score', 'correctCount', 'wrongCount', 'unansweredCount', 'completedAt'])
+        );
+
+      allow delete: if isSignedIn()
+        && existing().userId == request.auth.uid;
+    }
+  }
+}
