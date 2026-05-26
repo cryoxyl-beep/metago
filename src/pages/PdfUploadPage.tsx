@@ -160,8 +160,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
 
         console.log(`[Gemini Client] Requesting batch ${batchIdx + 1} of ${batches.length}...`);
 
-        const response = await ai.models.generateContent({
-          model: "gemini-1.5-flash",
+        const payloadConfig = {
           contents: userPrompt,
           config: {
             systemInstruction: "You are an expert curriculum assistant specializing in PDF reading recovery. Your sole job is to clean, separate, and reconstruct malformed question blocks into JSON format. Do not make up answers, do not speculate explanations, and do not invent content. Always preserve exact math equations, symbols, and formatting where possible.",
@@ -193,7 +192,30 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}
               }
             }
           }
-        });
+        };
+
+        let response;
+        try {
+          console.log(`[Gemini Client] Attempting generation with active model: gemini-2.5-flash (Batch ${batchIdx + 1} of ${batches.length})`);
+          response = await ai.models.generateContent({
+            model: "gemini-2.5-flash",
+            ...payloadConfig
+          });
+        } catch (firstTryError: any) {
+          console.warn(`[Gemini Client] Active model (gemini-2.5-flash) failed for batch ${batchIdx + 1}.`);
+          console.warn(`[Gemini Client] Model failure reason:`, firstTryError?.message || firstTryError);
+          console.log(`[Gemini Client] Fallback model usage triggered. Retrying batch ${batchIdx + 1} using fallback model: gemini-flash-latest`);
+          
+          try {
+            response = await ai.models.generateContent({
+              model: "gemini-flash-latest",
+              ...payloadConfig
+            });
+          } catch (secondTryError: any) {
+            console.error(`[Gemini Client] Both active and fallback model requests failed for batch ${batchIdx + 1}:`, secondTryError?.message || secondTryError);
+            throw secondTryError;
+          }
+        }
 
         // Log: Gemini response received
         const responseText = response.text || "[]";
