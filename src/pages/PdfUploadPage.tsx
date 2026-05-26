@@ -236,7 +236,7 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
           const endpointUrl = `https://generativelanguage.googleapis.com/v1beta/models/${selectedModel}:generateContent?key=${geminiApiKey}`;
           lastEndpoint = endpointUrl;
 
-          // STEP 3: thinking_config: { thinking_level: "low" }
+          // STEP 3: thinkingConfig: { thinkingBudget: 0 }
           const requestPayload = {
             systemInstruction: { parts: [{ text: systemMessage }] },
             contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
@@ -244,13 +244,16 @@ ${batch.map((c, i) => `Block ${i + 1}:\n${c}`).join("\n\n---\n\n")}`;
               responseMimeType: "application/json",
               thinkingConfig: {
                 thinkingBudget: 0
-              },
-              thinking_config: {
-                thinking_level: "low"
               }
             }
           };
           lastPayload = requestPayload;
+
+          console.log(`[Gemini Request Debug]
+- Selected Model: ${selectedModel}
+- GenerationConfig:`, JSON.stringify(requestPayload.generationConfig, null, 2), `
+- ThinkingConfig:`, JSON.stringify(requestPayload.generationConfig.thinkingConfig, null, 2), `
+- Final Request Body:`, JSON.stringify(requestPayload, null, 2));
 
           const response = await fetch(endpointUrl, {
             method: "POST",
