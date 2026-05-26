@@ -49,6 +49,18 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
   const [aiCleanedCount, setAiCleanedCount] = useState<number>(0);
   const [isAiCleaning, setIsAiCleaning] = useState<boolean>(false);
   const [ocrTelemetry, setOcrTelemetry] = useState<OcrTelemetry | null>(null);
+  const [geminiDebug, setGeminiDebug] = useState<{
+    modelName: string;
+    statusCode: number | null;
+    rawResponse: string;
+    parsedError: any | null;
+    malformedChunksCount: number;
+    durationMs: number | null;
+    endpoint: string;
+    requestPayload: any;
+    errorOccurred: boolean;
+    errorMessage: string | null;
+  } | null>(null);
 
   // Handle local PDF upload
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -115,23 +127,36 @@ export const PdfUploadPage: React.FC<PdfUploadPageProps> = ({ onUploadSuccess })
       return;
     }
 
+    setGeminiDebug(null); // Clear previous debug info
     setIsAiCleaning(true);
     setExtractionStage("Gemini 3.5 semantic cleanup running...");
 
     try {
       const geminiApiKey = (import.meta as any).env.VITE_GEMINI_API_KEY;
-      const groqApiKey = (import.meta as any).env.VITE_GROQ_API_KEY;
-
       const hasGemini = geminiApiKey && geminiApiKey.trim() !== "" && geminiApiKey !== "YOUR_GEMINI_API_KEY";
-      const hasGroq = groqApiKey && groqApiKey.trim() !== "" && groqApiKey !== "YOUR_GROQ_API_KEY";
 
-      if (!hasGemini && !hasGroq) {
-        console.warn("[AI Cleanup] No valid VITE_GEMINI_API_KEY or VITE_GROQ_API_KEY provided.");
-        throw new Error("Missing API Keys (Gemini/Groq). Please specify keys in the settings panel or .env file.");
+      if (!hasGemini) {
+        const errMsg = "Missing VITE_GEMINI_API_KEY. Please specify it in the settings panel or .env file.";
+        console.warn("[AI Cleanup] No valid VITE_GEMINI_API_KEY provided.");
+        
+        setGeminiDebug({
+          modelName: "gemini-3.5-flash",
+          statusCode: null,
+          rawResponse: "No prompt sent - missing API key configuration inside environment.",
+          parsedError: { error: "Missing API Key", message: errMsg },
+          malformedChunksCount: malformedChunks.length,
+          durationMs: 0,
+          endpoint: "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=undefined",
+          requestPayload: null,
+          errorOccurred: true,
+          errorMessage: errMsg
+        });
+
+        throw new Error(errMsg);
       }
 
-      // Log: Chain request started
-      console.log(`[AI Pipeline] Request started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
+      // Log: Chain request started in strict debug mode
+      console.log(`[AI Pipeline] [STRICT GEMINI-ONLY DEBUG MODE] Request started. Malformed chunk count: ${malformedChunks.length}. Initial confidence score: ${initialConfidence}%`);
 
       // Batch 3 to 5 malformed chunks maximum per request
       const batchSize = 4;
@@ -166,193 +191,134 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
   ]
 }`;
 
-        console.log(`[AI Pipeline] Preparing logic for batch ${batchIdx + 1} of ${batches.length}.`);
+        const modelName = "gemini-3.5-flash";
+        const endpointUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`;
+        const requestPayload = {
+          systemInstruction: { parts: [{ text: systemMessage }] },
+          contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
+          generationConfig: { responseMimeType: "application/json" }
+        };
 
-        let success = false;
-        let responseText = "";
-        let finalModelUsed = "";
-        const errorsList: string[] = [];
+        // Strict Console Logging Metrics
+        console.log(`[DEBUG MODE] Exact Endpoint Used:`, endpointUrl);
+        console.log(`[DEBUG MODE] Request Payload for Batch ${batchIdx + 1}:`, JSON.stringify(requestPayload, null, 2));
 
-        // 1. PRIMARY MODEL: gemini-3.5-flash
-        if (hasGemini && !success) {
-          const modelName = "gemini-3.5-flash";
-          try {
-            console.log(`[AI Pipeline] Dispatching request with active model: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
-            const startTime = performance.now();
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                systemInstruction: { parts: [{ text: systemMessage }] },
-                contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
-                generationConfig: { responseMimeType: "application/json" }
-              })
-            });
-
-            if (!response.ok) {
-              const errText = await response.text();
-              throw new Error(`HTTP status ${response.status}: ${errText}`);
-            }
-
-            const data = await response.json();
-            const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!textResult) {
-              throw new Error("Empty candidate part contents returned from Gemini REST API");
-            }
-
-            responseText = textResult;
-            finalModelUsed = modelName;
-            success = true;
-            console.log(`[AI Pipeline] Gemini 3.5 recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
-          } catch (gemErr35: any) {
-            const rawMsg = gemErr35?.message || String(gemErr35);
-            console.warn(`[AI Pipeline] Active model (${modelName}) failed/rate-limited for batch ${batchIdx + 1}: ${rawMsg}`);
-            errorsList.push(`${modelName}: ${rawMsg}`);
-          }
-        }
-
-        // 2. BACKUP MODEL: gemini-2.5-flash
-        if (hasGemini && !success) {
-          const modelName = "gemini-2.5-flash";
-          try {
-            console.log(`[AI Pipeline] Fallback model usage triggered: switching to backup Gemini: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
-            setExtractionStage("Gemini 3.5 failed, attempting Gemini 2.5...");
-            const startTime = performance.now();
-            const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${geminiApiKey}`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                systemInstruction: { parts: [{ text: systemMessage }] },
-                contents: [{ parts: [{ text: `${systemMessage}\n\nTask:\n${userPrompt}` }] }],
-                generationConfig: { responseMimeType: "application/json" }
-              })
-            });
-
-            if (!response.ok) {
-              const errText = await response.text();
-              throw new Error(`HTTP status ${response.status}: ${errText}`);
-            }
-
-            const data = await response.json();
-            const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
-            if (!textResult) {
-              throw new Error("Empty candidate part contents returned from Gemini REST API");
-            }
-
-            responseText = textResult;
-            finalModelUsed = modelName;
-            success = true;
-            console.log(`[AI Pipeline] Gemini 2.5 recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
-          } catch (gemErr25: any) {
-            const rawMsg = gemErr25?.message || String(gemErr25);
-            console.warn(`[AI Pipeline] Backup model (${modelName}) failed/rate-limited for batch ${batchIdx + 1}: ${rawMsg}`);
-            errorsList.push(`${modelName}: ${rawMsg}`);
-          }
-        }
-
-        // 3. GROQ KEY FALLBACK: qwen/qwen3-32b
-        if (hasGroq && !success) {
-          const modelName = "qwen/qwen3-32b";
-          try {
-            console.warn(`[AI Pipeline] Gemini rate limit reached or layers failed, switching to Groq fallback: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
-            setExtractionStage("Gemini rate limit reached, switching to Groq fallback...");
-            const startTime = performance.now();
-            const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${groqApiKey}`
-              },
-              body: JSON.stringify({
-                model: modelName,
-                messages: [
-                  { role: "system", content: systemMessage },
-                  { role: "user", content: userPrompt }
-                ],
-                temperature: 0.1,
-                response_format: { type: "json_object" }
-              })
-            });
-
-            if (!response.ok) {
-              const errText = await response.text();
-              throw new Error(`HTTP status ${response.status}: ${errText}`);
-            }
-
-            const responseData = await response.json();
-            const textResult = responseData?.choices?.[0]?.message?.content;
-            if (!textResult) {
-              throw new Error("Empty chat content returned from Groq chat completion API");
-            }
-
-            responseText = textResult;
-            finalModelUsed = modelName;
-            success = true;
-            setExtractionStage("Groq semantic recovery active...");
-            console.log(`[AI Pipeline] Groq Qwen recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
-          } catch (groqErr: any) {
-            const rawMsg = groqErr?.message || String(groqErr);
-            console.warn(`[AI Pipeline] Groq fallback (${modelName}) failed for batch ${batchIdx + 1}: ${rawMsg}`);
-            errorsList.push(`${modelName}: ${rawMsg}`);
-          }
-        }
-
-        // 4. GROQ SECOND FALLBACK: llama-3.3-70b-versatile
-        if (hasGroq && !success) {
-          const modelName = "llama-3.3-70b-versatile";
-          try {
-            console.warn(`[AI Pipeline] Groq Qwen failed, switching to Groq backup Llama: ${modelName} (Batch ${batchIdx + 1}/${batches.length})`);
-            setExtractionStage("Groq semantic recovery active...");
-            const startTime = performance.now();
-            const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                "Authorization": `Bearer ${groqApiKey}`
-              },
-              body: JSON.stringify({
-                model: modelName,
-                messages: [
-                  { role: "system", content: systemMessage },
-                  { role: "user", content: userPrompt }
-                ],
-                temperature: 0.1,
-                response_format: { type: "json_object" }
-              })
-            });
-
-            if (!response.ok) {
-              const errText = await response.text();
-              throw new Error(`HTTP status ${response.status}: ${errText}`);
-            }
-
-            const responseData = await response.json();
-            const textResult = responseData?.choices?.[0]?.message?.content;
-            if (!textResult) {
-              throw new Error("Empty chat content returned from Groq chat completion API");
-            }
-
-            responseText = textResult;
-            finalModelUsed = modelName;
-            success = true;
-            console.log(`[AI Pipeline] Groq Llama backup recovery success in ${(performance.now() - startTime).toFixed(1)}ms. Status: OK`);
-          } catch (llamaErr: any) {
-            const rawMsg = llamaErr?.message || String(llamaErr);
-            console.error(`[AI Pipeline] Groq Llama fallback (${modelName}) failed for batch ${batchIdx + 1}: ${rawMsg}`);
-            errorsList.push(`${modelName}: ${rawMsg}`);
-          }
-        }
-
-        if (!success) {
-          throw new Error(`All semantic reconstitution models failed to process batch ${batchIdx + 1}:\n${errorsList.join("\n")}`);
-        }
-
-        // Log active provider, chunk index, latency, and success status
-        console.log(`[AI Pipeline] Batch ${batchIdx + 1} finalized successfully. Active provider utilized: ${finalModelUsed}`);
+        const startTime = performance.now();
+        let response: Response;
 
         try {
-          const parsedGroup = JSON.parse(responseText.trim());
-          console.log(`[AI Pipeline] JSON parsing success status for batch ${batchIdx + 1}.`);
+          response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestPayload)
+          });
+        } catch (fetchErr: any) {
+          const duration = performance.now() - startTime;
+          const errMsg = fetchErr?.message || String(fetchErr);
+          console.error(`[DEBUG MODE] Fetch error / CORS issue for batch ${batchIdx + 1}:`, errMsg);
+          
+          setGeminiDebug({
+            modelName,
+            statusCode: null,
+            rawResponse: `Network error, CORS block, or offline stream: ${errMsg}`,
+            parsedError: { fetchError: errMsg },
+            malformedChunksCount: batch.length,
+            durationMs: duration,
+            endpoint: endpointUrl,
+            requestPayload,
+            errorOccurred: true,
+            errorMessage: `CORS issue / Network block: ${errMsg}`
+          });
+          
+          throw new Error(`CORS/Connection failure on Gemini request for batch ${batchIdx + 1}: ${errMsg}`);
+        }
+
+        const duration = performance.now() - startTime;
+        console.log(`[DEBUG MODE] response.ok status for batch ${batchIdx + 1}:`, response.ok);
+        console.log(`[DEBUG MODE] Response HTTP status for batch ${batchIdx + 1}:`, response.status);
+
+        let responseText = "";
+        try {
+          responseText = await response.text();
+        } catch (textReadErr: any) {
+          console.error(`[DEBUG MODE] Failed to read response stream for batch ${batchIdx + 1}:`, textReadErr);
+        }
+
+        console.log(`[DEBUG MODE] Response Payload for Batch ${batchIdx + 1}:`, responseText);
+
+        let parsedErrorObj: any = null;
+        if (!response.ok) {
+          try {
+            parsedErrorObj = JSON.parse(responseText);
+          } catch (e) {
+            parsedErrorObj = { rawErrorText: responseText };
+          }
+
+          setGeminiDebug({
+            modelName,
+            statusCode: response.status,
+            rawResponse: responseText,
+            parsedError: parsedErrorObj,
+            malformedChunksCount: batch.length,
+            durationMs: duration,
+            endpoint: endpointUrl,
+            requestPayload,
+            errorOccurred: true,
+            errorMessage: parsedErrorObj?.error?.message || `HTTP error ${response.status}: ${responseText}`
+          });
+
+          throw new Error(`Gemini API failed with status ${response.status}: ${parsedErrorObj?.error?.message || responseText}`);
+        }
+
+        let parsedData: any;
+        try {
+          parsedData = JSON.parse(responseText);
+        } catch (jsonErr: any) {
+          console.error(`[DEBUG MODE] JSON Parse Failure on Gemini response payload for batch ${batchIdx + 1}:`, jsonErr);
+          setGeminiDebug({
+            modelName,
+            statusCode: response.status,
+            rawResponse: responseText,
+            parsedError: { jsonParseError: jsonErr?.message || String(jsonErr) },
+            malformedChunksCount: batch.length,
+            durationMs: duration,
+            endpoint: endpointUrl,
+            requestPayload,
+            errorOccurred: true,
+            errorMessage: `Malformed JSON Response: Failed to compile raw API output stream.`
+          });
+          throw new Error(`Malformed JSON output from Gemini API: ${jsonErr.message}`);
+        }
+
+        const candidateStatus = parsedData.candidates && parsedData.candidates[0] ? "valid" : "empty_or_blocked";
+        console.log(`[DEBUG MODE] Candidate Parsing Status for Batch ${batchIdx + 1}:`, candidateStatus);
+
+        const textResult = parsedData.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!textResult) {
+          console.warn(`[DEBUG MODE] No text content found in parts. Candidates list:`, JSON.stringify(parsedData.candidates, null, 2));
+          const blockedReason = parsedData.candidates?.[0]?.finishReason || "No candidates found";
+          const errMessage = `Empty response content/Blocked candidate in Gemini reply. Reason: ${blockedReason}`;
+          setGeminiDebug({
+            modelName,
+            statusCode: response.status,
+            rawResponse: responseText,
+            parsedError: parsedData,
+            malformedChunksCount: batch.length,
+            durationMs: duration,
+            endpoint: endpointUrl,
+            requestPayload,
+            errorOccurred: true,
+            errorMessage: errMessage
+          });
+          throw new Error(errMessage);
+        }
+
+        // Successfully processed
+        console.log(`[AI Pipeline] Gemini 3.5 recovery success in ${duration.toFixed(1)}ms for Batch ${batchIdx + 1}.`);
+
+        try {
+          const parsedGroup = JSON.parse(textResult.trim());
+          console.log(`[AI Pipeline] Sub-JSON parsing success status for batch ${batchIdx + 1}.`);
 
           let list: any[] = [];
           if (Array.isArray(parsedGroup)) {
@@ -365,10 +331,39 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
               list = (parsedGroup as any)[firstArrayKey];
             }
           }
+
+          // Save successful state telemetry on last batch
+          if (batchIdx === batches.length - 1) {
+            setGeminiDebug({
+              modelName,
+              statusCode: response.status,
+              rawResponse: responseText,
+              parsedError: null,
+              malformedChunksCount: malformedChunks.length,
+              durationMs: duration,
+              endpoint: endpointUrl,
+              requestPayload,
+              errorOccurred: false,
+              errorMessage: null
+            });
+          }
+
           return list;
-        } catch (jsonErr) {
-          console.error(`[AI Pipeline] JSON parsing failure status for batch ${batchIdx + 1}:`, responseText, jsonErr);
-          throw jsonErr;
+        } catch (innerJsonErr: any) {
+          console.error(`[DEBUG MODE] Inner JSON parse failure from extracted text content of batch ${batchIdx + 1}:`, textResult, innerJsonErr);
+          setGeminiDebug({
+            modelName,
+            statusCode: response.status,
+            rawResponse: responseText,
+            parsedError: { innerJsonParseError: innerJsonErr?.message || String(innerJsonErr), textResult },
+            malformedChunksCount: batch.length,
+            durationMs: duration,
+            endpoint: endpointUrl,
+            requestPayload,
+            errorOccurred: true,
+            errorMessage: `Inner JSON Parse Failure inside recovered text content: ${innerJsonErr?.message || String(innerJsonErr)}`
+          });
+          throw innerJsonErr;
         }
       });
 
@@ -421,10 +416,10 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
         setWarning(`AI cleanup recovery applied to malformed question blocks. Reconstructed ${aiQuestions.length} questions semantically from mangled PDF layout.`);
       }
     } catch (apiErr: any) {
-      console.warn("[AI Fallback Engine] Semantic cleanup model request chain failed completely:", apiErr);
+      console.warn("[AI STRICT GEMINI-ONLY DEBUG ENGINE] Semantic cleanup request failed:", apiErr);
       setQuestions(initialQuestions);
       setAiCleanedCount(0);
-      setWarning(`Notice: AI-powered recovery was bypassed (${apiErr.message || "Invalid API keys or network blocks"}). Reverting to default regex parsed result.`);
+      setWarning(`Notice: AI-powered recovery was bypassed with errors (${apiErr.message || "Invalid API keys or network blocks"}). Reverting to default regex parsed result.`);
     } finally {
       setIsAiCleaning(false);
     }
@@ -859,6 +854,116 @@ You MUST reply with a JSON object containing a "questions" key containing an arr
       {/* Worksheet Review Section */}
       {questions.length > 0 && (
         <div className="flex flex-col gap-6 animate-fade-in">
+          {/* STRICT GEMINI-ONLY DEVELOPER DEBUG PANEL */}
+          {geminiDebug && (
+            <div className={`border rounded-lg p-5 flex flex-col gap-4 font-sans ${
+              geminiDebug.errorOccurred 
+                ? "border-rose-900 bg-rose-950/10 text-rose-200" 
+                : "border-emerald-900 bg-emerald-950/10 text-emerald-200"
+            }`}>
+              <div className="flex items-center justify-between border-b pb-3" style={{ borderColor: geminiDebug.errorOccurred ? "rgba(224, 36, 36, 0.2)" : "rgba(16, 185, 129, 0.2)" }}>
+                <div className="flex items-center gap-2">
+                  <span className={`h-2.5 w-2.5 rounded-full ${geminiDebug.errorOccurred ? "bg-rose-500 animate-pulse" : "bg-emerald-500"}`} />
+                  <h3 className="text-xs font-bold uppercase tracking-wider font-mono">
+                    🔧 Gemini API Debug Diagnostics (Strict AI-Only Mode)
+                  </h3>
+                </div>
+                <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded uppercase border ${
+                  geminiDebug.errorOccurred 
+                    ? "bg-rose-950/40 text-rose-400 border-rose-900/40" 
+                    : "bg-emerald-950/40 text-emerald-400 border-emerald-900/40"
+                }`}>
+                  {geminiDebug.errorOccurred ? "API FAILURE" : "API SUCCESS"}
+                </span>
+              </div>
+
+              {geminiDebug.errorOccurred && geminiDebug.errorMessage && (
+                <div className="flex items-start gap-2 bg-rose-950/30 border border-rose-900/45 p-3 rounded text-xs select-text">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <div className="flex-1">
+                    <p className="font-semibold text-rose-300">Exact Gemini API Error Displayed:</p>
+                    <p className="font-mono mt-1 break-words leading-relaxed whitespace-pre-wrap">{geminiDebug.errorMessage}</p>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 font-mono text-xs text-zinc-300">
+                <div className="bg-zinc-950/60 p-3 rounded border border-zinc-900 flex flex-col justify-center">
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold mb-1">Gemini Model Used</span>
+                  <span className="font-bold text-zinc-100">{geminiDebug.modelName}</span>
+                </div>
+                <div className="bg-zinc-950/60 p-3 rounded border border-zinc-900 flex flex-col justify-center">
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold mb-1">HTTP Status Code</span>
+                  <span className={`font-bold ${
+                    geminiDebug.statusCode === 200 
+                      ? "text-emerald-400" 
+                      : geminiDebug.statusCode 
+                        ? "text-rose-400" 
+                        : "text-amber-400"
+                  }`}>
+                    {geminiDebug.statusCode !== null ? `${geminiDebug.statusCode}` : "CORS / NETWORK BLOCK"}
+                  </span>
+                </div>
+                <div className="bg-zinc-950/60 p-3 rounded border border-zinc-900 flex flex-col justify-center">
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold mb-1">Request Latency</span>
+                  <span className="font-bold text-amber-400">
+                    {geminiDebug.durationMs !== null ? `${geminiDebug.durationMs.toFixed(1)} ms` : "N/A"}
+                  </span>
+                </div>
+                <div className="bg-zinc-950/60 p-3 rounded border border-zinc-900 flex flex-col justify-center">
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold mb-1">Malformed Chunks Input</span>
+                  <span className="font-bold text-zinc-100">{geminiDebug.malformedChunksCount} Chunks</span>
+                </div>
+                <div className="bg-zinc-950/60 p-3 rounded border border-zinc-900 md:col-span-2 flex flex-col justify-center font-mono">
+                  <span className="text-[10px] text-zinc-500 uppercase tracking-widest font-semibold mb-1">Target Endpoint API URL</span>
+                  <span className="text-zinc-400 break-all select-all font-mono text-[10px] truncate">{geminiDebug.endpoint}</span>
+                </div>
+              </div>
+
+              {/* Developer details and logs collapsible container */}
+              <div className="flex flex-col gap-2.5 mt-2">
+                <span className="text-[10px] font-mono text-zinc-500 uppercase tracking-wider">Payload inspection panels (Details)</span>
+                
+                <details className="group border border-zinc-900 rounded bg-zinc-950/50 p-2.5 transition-colors">
+                  <summary className="cursor-pointer text-xs font-mono font-semibold text-zinc-400 hover:text-zinc-200 flex justify-between items-center select-none">
+                    <span>1. Request Payload JSON Stream</span>
+                    <span className="text-[10px] text-zinc-500 group-open:hidden">Expand</span>
+                    <span className="text-[10px] text-zinc-500 hidden group-open:block">Collapse</span>
+                  </summary>
+                  <div className="mt-2.5 text-[11px] font-mono bg-zinc-900/80 border border-zinc-950 p-3 rounded overflow-x-auto text-zinc-355 max-h-60 leading-relaxed scrollbar-thin select-all">
+                    <pre className="whitespace-pre-wrap">{JSON.stringify(geminiDebug.requestPayload, null, 2)}</pre>
+                  </div>
+                </details>
+
+                <details className="group border border-zinc-900 rounded bg-zinc-950/50 p-2.5 transition-colors">
+                  <summary className="cursor-pointer text-xs font-mono font-semibold text-zinc-400 hover:text-zinc-200 flex justify-between items-center select-none">
+                    <span>2. Raw Gemini API Response Stream</span>
+                    <span className="text-[10px] text-zinc-500 group-open:hidden">Expand</span>
+                    <span className="text-[10px] text-zinc-500 hidden group-open:block">Collapse</span>
+                  </summary>
+                  <div className="mt-2.5 text-[11px] font-mono bg-zinc-900/80 border border-zinc-950 p-3 rounded overflow-x-auto text-zinc-355 max-h-60 leading-relaxed scrollbar-thin select-all">
+                    <pre className="whitespace-pre-wrap">{geminiDebug.rawResponse || "(No response stream received)"}</pre>
+                  </div>
+                </details>
+
+                <details className="group border border-zinc-900 rounded bg-zinc-950/50 p-2.5 transition-colors">
+                  <summary className="cursor-pointer text-xs font-mono font-semibold text-zinc-400 hover:text-zinc-200 flex justify-between items-center select-none">
+                    <span>3. Parsed Error / Payload Diagnostic Tree</span>
+                    <span className="text-[10px] text-zinc-500 group-open:hidden">Expand</span>
+                    <span className="text-[10px] text-zinc-500 hidden group-open:block">Collapse</span>
+                  </summary>
+                  <div className="mt-2.5 text-[11px] font-mono bg-zinc-900/80 border border-zinc-950 p-3 rounded overflow-x-auto text-zinc-355 max-h-60 leading-relaxed scrollbar-thin select-all">
+                    <pre className="whitespace-pre-wrap">
+                      {geminiDebug.parsedError 
+                        ? JSON.stringify(geminiDebug.parsedError, null, 2) 
+                        : "null (No parsed API error object present)"}
+                    </pre>
+                  </div>
+                </details>
+              </div>
+            </div>
+          )}
+
           {/* AI Metrics & Insights Panel */}
           {parserConfidence !== null && (
             <div className="border border-zinc-900 bg-zinc-950 p-5 rounded-lg flex flex-col gap-4">
